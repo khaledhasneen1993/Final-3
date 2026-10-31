@@ -11,3 +11,6 @@ dashboard-config*.json
 
 *.lock
 sessions/
+
+.venv-dashboard/
+.runtime/
