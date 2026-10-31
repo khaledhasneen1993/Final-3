@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 import binance_cascade_hunter_dynamic_v2 as strategy
 
 
+class PartialStopCrossed(ValueError):
+    def __init__(self, price):
+        self.price = price
+        super().__init__("Full stop crossed before partial execution")
+
+
 class PaperExchange:
     """Explicit public-data allowlist. Orders and balances exist only in memory."""
 
@@ -83,14 +89,21 @@ class PaperExchange:
         closing = bool((params or {}).get("reduceOnly", False))
         position = self.positions.get(symbol)
         if closing and (not position or position["side"] == side
-                        or not math.isclose(amount, position["amount"])):
+                        or (amount > position["amount"] and not math.isclose(amount, position["amount"]))):
             raise ValueError("Invalid reduce-only close")
+        full_close = bool(closing and math.isclose(amount, position["amount"]))
+        if full_close:
+            amount = position["amount"]
         if not closing and position and not (params or {}).get("scaleIn"):
             raise ValueError("Position already exists")
         if not closing and position and position["side"] != side:
             raise ValueError("Scale-in must match position direction")
         execution_ticker = await self.fetch_ticker(symbol)
         price = float(execution_ticker["last"])
+        if closing and not full_close and (params or {}).get("partialStop") is not None:
+            direction = 1 if position["side"] == "buy" else -1
+            if direction * (price - float(params["partialStop"])) <= 0:
+                raise PartialStopCrossed(price)
         notional = amount * price
         fee = notional * self.fee_rate
         pnl = 0.0
@@ -98,8 +111,16 @@ class PaperExchange:
             pnl = (price - position["entry"]) * amount * (
                 1 if position["side"] == "buy" else -1
             )
+            fees_paid = position.get("fees_paid", position["entry"] * position["amount"] * self.fee_rate) + fee
+            realized_pnl = position.get("realized_pnl", 0.0) + pnl
+            released_margin = position["margin"] * amount / position["amount"]
             self.balance += pnl - fee
-            del self.positions[symbol]
+            if full_close:
+                del self.positions[symbol]
+            else:
+                self.positions[symbol] = {**position, "amount": position["amount"] - amount,
+                    "margin": position["margin"] - released_margin,
+                    "fees_paid": fees_paid, "realized_pnl": realized_pnl}
         else:
             limits = self.market_data.market(symbol).get("limits", {})
             for key, value in (("amount", amount), ("cost", notional)):
@@ -119,6 +140,8 @@ class PaperExchange:
                 self.positions[symbol] = {
                     "side": side, "entry": (position["entry"] * position["amount"] + price * amount) / combined,
                     "amount": combined, "margin": position["margin"] + margin,
+                    "fees_paid": position.get("fees_paid", position["entry"] * position["amount"] * self.fee_rate) + fee,
+                    "realized_pnl": position.get("realized_pnl", 0.0),
                 }
             else:
                 self.positions[symbol] = {
@@ -133,6 +156,12 @@ class PaperExchange:
             "reduceOnly": closing, "scale_in": bool((params or {}).get("scaleIn")), "fee_usdt": fee, "pnl_usdt": pnl,
             "balance_usdt": self.balance,
         }
+        if closing:
+            trade.update(partial_close=not full_close, exit_reason=(params or {}).get("exit_reason"),
+                         remaining_amount=0.0 if full_close else self.positions[symbol]["amount"],
+                         released_margin_usdt=released_margin)
+            if full_close:
+                trade["position_net_pnl_usdt"] = realized_pnl - fees_paid
         self.trades.append(trade)
         strategy.log.info("PAPER FILL %s | %s %s | wallet=%.4f free=%.4f equity=%.4f",
                           trade["id"], side, symbol, self.balance, self.free, self.equity)

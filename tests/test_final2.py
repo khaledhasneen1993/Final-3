@@ -35,11 +35,11 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p['adds_done'], 1)
         self.assertAlmostEqual(fill['price']*fill['amount'], 500, delta=.1)
         self.assertAlmostEqual(self.bot.exchange.used, 20, delta=.01)
-        self.assertEqual(p['sl'], 93)
+        self.assertAlmostEqual(p['sl'], p['entry']*.96)
         self.assertEqual(len(self.bot.positions), 1)
 
     async def test_one_add_only(self):
-        await self.price(97.5); await self.price(96); await self.price(95.1)
+        await self.price(97.5); await self.price(96); await self.price(95.8)
         self.assertEqual(self.bot.positions[S]['adds_done'], 1)
         self.assertEqual(len(self.bot.exchange.trades), 2)
 
@@ -53,20 +53,20 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.bot.exchange.trades), 2)
         self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'], 'SL')
 
-    async def test_old_five_percent_level_keeps_position_open(self):
+    async def test_late_add_tightens_from_new_average(self):
         await self.price(95)
         self.assertIn(S, self.bot.positions)
         self.assertEqual(self.bot.positions[S]['adds_done'], 1)
-        self.assertEqual(self.bot.positions[S]['sl'], 93)
+        self.assertAlmostEqual(self.bot.positions[S]['sl'], self.bot.positions[S]['entry']*.96)
         await self.price(93)
         self.assertNotIn(S, self.bot.positions)
 
-    async def test_short_old_stop_keeps_position_open(self):
+    async def test_short_late_add_tightens_from_new_average(self):
         await self.bot.close_position(S, 'TEST', 100); self.bot.last_trade.clear()
         await self.bot.enter(S, 'sell', 100)
         await self.price(105)
         self.assertIn(S, self.bot.positions)
-        self.assertEqual(self.bot.positions[S]['sl'], 107)
+        self.assertAlmostEqual(self.bot.positions[S]['sl'], self.bot.positions[S]['entry']*1.04)
         await self.price(107)
         self.assertNotIn(S, self.bot.positions)
 
@@ -75,13 +75,13 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bot.positions)
         self.assertEqual(len(self.bot.exchange.trades), 2)
 
-    async def test_averaged_stop_remains_original(self):
+    async def test_averaged_stop_is_tightened(self):
         await self.price(97.5)
         self.assertNotEqual(self.bot.positions[S]['entry'],100)
-        self.assertEqual(self.bot.positions[S]['sl'],93)
+        self.assertAlmostEqual(self.bot.positions[S]['sl'],self.bot.positions[S]['entry']*.96)
         await self.price(93)
         self.assertFalse(self.bot.positions)
-        self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'],'SL')
+        self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'],'TIGHT_SL')
 
     async def test_fill_basis_when_signal_differs(self):
         bot=Final2PaperHunter(Path(self.t.name)/'different.json',fee_rate=0,market_data=self.data)
@@ -149,7 +149,7 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         await self.bot.enter(S,'sell',100)
         await self.price(102.49);self.assertEqual(self.bot.positions[S]['adds_done'],0)
         await self.price(102.5);p=self.bot.positions[S]
-        self.assertEqual(p['adds_done'],1);self.assertEqual(p['sl'],107)
+        self.assertEqual(p['adds_done'],1);self.assertAlmostEqual(p['sl'],p['entry']*1.04)
         fill=self.bot.exchange.trades[-1]
         self.assertAlmostEqual(fill['amount']*fill['price'],500,delta=.11)
         await self.price(104);self.assertEqual(p['adds_done'],1)

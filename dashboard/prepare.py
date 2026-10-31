@@ -1,4 +1,4 @@
-"""Validate or migrate only an idle Final-3 account under its writer lock."""
+"""Validate or migrate a compatible Final-3 account under its writer lock."""
 import fcntl
 import sys
 from paths import ROOT, STATE_PATHS
@@ -13,7 +13,7 @@ def prepare():
         if path.exists():
             backup = migrate(path)
             if backup:
-                print('Final-3 idle settings updated to 7% stop; wallet and fills preserved. Backup:', backup)
+                print('Final-3 risk settings updated; wallet, positions and fills preserved. Backup:', backup)
             else:
                 print('Final-3 account settings match; resuming saved account.')
         else:

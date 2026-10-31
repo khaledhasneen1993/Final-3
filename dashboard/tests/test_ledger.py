@@ -18,6 +18,20 @@ class LedgerTests(unittest.TestCase):
         self.assertAlmostEqual(closed[0]['average_entry'],310/3)
         self.assertAlmostEqual(closed[0]['net_pnl_usdt'],39.71)
         self.assertEqual(opened[0]['side'],'buy')
+    def test_partial_is_not_a_completed_position(self):
+        def fill(side,amount,price,fee,close=False,pnl=0,partial=False):
+            return dict(symbol='BTC',side=side,amount=amount,price=price,fee_usdt=fee,
+                        reduceOnly=close,pnl_usdt=pnl,partial_close=partial,timestamp='2026-10-31')
+        fills=[fill('buy',2,100,.1),fill('buy',2,98,.098),
+               fill('sell',2,96,.096,True,-6,True)]
+        opened,closed=round_trips(fills)
+        self.assertEqual(len(opened),1);self.assertFalse(closed)
+        self.assertEqual(opened[0]['remaining_amount'],2)
+        fills.append(fill('sell',2,100,.1,True,2))
+        opened,closed=round_trips(fills)
+        self.assertFalse(opened);self.assertEqual(len(closed),1)
+        self.assertAlmostEqual(closed[0]['net_pnl_usdt'],-4.394)
+
     def test_empty(self):
         self.assertEqual(round_trips([]),([],[]))
 
