@@ -132,7 +132,7 @@ class ExecutionFreshnessTests(unittest.IsolatedAsyncioTestCase):
         async def ticker(symbol):
             nonlocal calls
             calls += 1
-            return {'last': 94, 'timestamp': (time.time()-(60 if calls > 1 else 0))*1000}
+            return {'last': 92, 'timestamp': (time.time()-(60 if calls > 1 else 0))*1000}
         self.data.fetch_ticker = ticker
         await self.bot.manage_exits()
         self.assertEqual(calls, 2)

@@ -20,7 +20,7 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_settings_and_initial_margin(self):
         s = self.bot.settings()
-        self.assertEqual((s['MAX_POSITION_PCT'],s['STOP_LOSS_PCT'],s['MAX_CONCURRENT_POSITIONS']),(.10,.05,5))
+        self.assertEqual((s['MAX_POSITION_PCT'],s['STOP_LOSS_PCT'],s['MAX_CONCURRENT_POSITIONS']),(.10,.07,5))
         self.assertEqual(s['stop_basis'], 'original_fill_price')
         self.assertAlmostEqual(self.bot.exchange.used, 10)
         self.assertAlmostEqual(self.bot.positions[S]['original_notional'], 500)
@@ -35,7 +35,7 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p['adds_done'], 1)
         self.assertAlmostEqual(fill['price']*fill['amount'], 500, delta=.1)
         self.assertAlmostEqual(self.bot.exchange.used, 20, delta=.01)
-        self.assertEqual(p['sl'], 95)
+        self.assertEqual(p['sl'], 93)
         self.assertEqual(len(self.bot.positions), 1)
 
     async def test_one_add_only(self):
@@ -48,28 +48,45 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.positions[S]['adds_done'], 1)
 
     async def test_stop_priority_on_gap(self):
-        await self.price(94)
+        await self.price(92)
         self.assertFalse(self.bot.positions)
         self.assertEqual(len(self.bot.exchange.trades), 2)
         self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'], 'SL')
 
-    async def test_stop_at_five_percent(self):
+    async def test_old_five_percent_level_keeps_position_open(self):
         await self.price(95)
+        self.assertIn(S, self.bot.positions)
+        self.assertEqual(self.bot.positions[S]['adds_done'], 1)
+        self.assertEqual(self.bot.positions[S]['sl'], 93)
+        await self.price(93)
+        self.assertNotIn(S, self.bot.positions)
+
+    async def test_short_old_stop_keeps_position_open(self):
+        await self.bot.close_position(S, 'TEST', 100); self.bot.last_trade.clear()
+        await self.bot.enter(S, 'sell', 100)
+        await self.price(105)
+        self.assertIn(S, self.bot.positions)
+        self.assertEqual(self.bot.positions[S]['sl'], 107)
+        await self.price(107)
+        self.assertNotIn(S, self.bot.positions)
+
+    async def test_stop_at_seven_percent(self):
+        await self.price(93)
         self.assertFalse(self.bot.positions)
         self.assertEqual(len(self.bot.exchange.trades), 2)
 
     async def test_averaged_stop_remains_original(self):
         await self.price(97.5)
         self.assertNotEqual(self.bot.positions[S]['entry'],100)
-        self.assertEqual(self.bot.positions[S]['sl'],95)
-        await self.price(95)
+        self.assertEqual(self.bot.positions[S]['sl'],93)
+        await self.price(93)
         self.assertFalse(self.bot.positions)
         self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'],'SL')
 
     async def test_fill_basis_when_signal_differs(self):
         bot=Final2PaperHunter(Path(self.t.name)/'different.json',fee_rate=0,market_data=self.data)
         await bot.enter(S,'buy',80)
-        self.assertEqual(bot.positions[S]['sl'],95)
+        self.assertEqual(bot.positions[S]['sl'],93)
         self.assertEqual(bot.positions[S]['original_entry'],100)
         self.data.price=97.5;await bot.manage_exits()
         self.assertEqual(bot.positions[S]['adds_done'],1)
@@ -132,7 +149,7 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
         await self.bot.enter(S,'sell',100)
         await self.price(102.49);self.assertEqual(self.bot.positions[S]['adds_done'],0)
         await self.price(102.5);p=self.bot.positions[S]
-        self.assertEqual(p['adds_done'],1);self.assertEqual(p['sl'],105)
+        self.assertEqual(p['adds_done'],1);self.assertEqual(p['sl'],107)
         fill=self.bot.exchange.trades[-1]
         self.assertAlmostEqual(fill['amount']*fill['price'],500,delta=.11)
         await self.price(104);self.assertEqual(p['adds_done'],1)
@@ -142,7 +159,7 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_short_stop_priority(self):
         await self.bot.close_position(S,'TEST',100);self.bot.last_trade.clear()
-        await self.bot.enter(S,'sell',100);await self.price(105)
+        await self.bot.enter(S,'sell',100);await self.price(107)
         self.assertFalse(self.bot.positions)
         self.assertEqual(self.bot.exchange.trades[-1]['exit_reason'],'SL')
         self.assertEqual(len(self.bot.exchange.trades),4)
@@ -150,9 +167,9 @@ class Final2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_all_fees_and_weighted_pnl(self):
         self.bot=Final2PaperHunter(Path(self.t.name)/'fee.json',market_data=self.data)
         await self.bot.enter(S,'buy',100);await self.price(97.5)
-        p=self.bot.exchange.positions[S].copy();await self.price(95)
+        p=self.bot.exchange.positions[S].copy();await self.price(93)
         fees=sum(t['fee_usdt'] for t in self.bot.exchange.trades)
-        pnl=(95-p['entry'])*p['amount']
+        pnl=(93-p['entry'])*p['amount']
         self.assertAlmostEqual(self.bot.exchange.balance,100+pnl-fees)
         self.assertEqual(len(self.bot.exchange.trades),3)
 

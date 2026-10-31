@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from migrate_idle_state import current_settings, legacy_settings, migrate, plan
+from migrate_idle_state import current_settings, legacy_settings, previous_final3_settings, migrate, plan
 from cascade_final2_paper import Final2PaperHunter
 from fixtures import DynamicPublicData
 
@@ -35,3 +35,20 @@ class MigrationTests(unittest.TestCase):
     def test_plan_does_not_write(self):
         before=self.path.read_bytes();_,changed=plan(self.path)
         self.assertTrue(changed);self.assertEqual(before,self.path.read_bytes())
+
+    def test_final3_five_percent_idle_wallet_and_fills_preserved(self):
+        self.state['settings'] = previous_final3_settings()
+        self.path.write_text(json.dumps(self.state))
+        before = self.path.read_bytes()
+        backup = migrate(self.path)
+        self.assertEqual(backup.read_bytes(), before)
+        after = json.loads(self.path.read_text())
+        self.assertEqual(after, {**self.state, 'settings': current_settings()})
+        self.assertEqual(after['settings']['STOP_LOSS_PCT'], .07)
+
+    def test_final3_five_percent_open_state_rejected(self):
+        self.state['settings'] = previous_final3_settings()
+        self.state['strategy_positions'] = {'BTC': {'sl': 95}}
+        self.path.write_text(json.dumps(self.state)); before = self.path.read_bytes()
+        with self.assertRaises(ValueError): migrate(self.path)
+        self.assertEqual(self.path.read_bytes(), before)

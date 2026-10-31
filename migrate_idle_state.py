@@ -22,10 +22,14 @@ def legacy_settings():
             'add_fraction': .50, 'stop_basis': 'original_signal_price'}
 
 
+def previous_final3_settings():
+    return {**current_settings(), 'STOP_LOSS_PCT': .05}
+
+
 def plan(path):
     path = Path(path)
     state = json.loads(path.read_text(encoding='utf-8'))
-    if state.get('version') != 1 or state.get('settings') not in (legacy_settings(), current_settings()):
+    if state.get('version') != 1 or state.get('settings') not in (legacy_settings(), previous_final3_settings(), current_settings()):
         raise ValueError('Unrecognized state settings; no files changed')
     if state['settings'] == current_settings():
         return state, False
