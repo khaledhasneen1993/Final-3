@@ -7,8 +7,14 @@ import time
 from datetime import datetime, timezone
 import config as strategy
 
-MAX_TICKER_AGE = 10.0
-TICKER_TIMEOUT = 10.0
+MAX_TICKER_AGE = 2.0
+TICKER_TIMEOUT = 2.0
+
+
+class PartialStopCrossed(ValueError):
+    def __init__(self, price):
+        self.price = price
+        super().__init__("Full stop crossed before partial execution")
 
 
 class PaperExchange:
@@ -54,13 +60,21 @@ class PaperExchange:
         return self.market_data.amount_to_precision(symbol, amount)
 
     async def fetch_ticker(self, symbol):
-        ticker = await asyncio.wait_for(
-            self.market_data.fetch_ticker(symbol), TICKER_TIMEOUT
-        )
+        scanner = getattr(self, "scanner", None)
+        ticker = scanner.execution_quote(symbol) if scanner is not None else None
+        if ticker is None:
+            ticker = await asyncio.wait_for(
+                self.market_data.fetch_ticker(symbol), TICKER_TIMEOUT
+            )
         timestamp = ticker.get("timestamp")
         if timestamp is None:
             raise ValueError("Missing market timestamp; paper execution rejected")
-        age = time.time() - float(timestamp) / 1000
+        now = (
+            scanner.wall_clock()
+            if scanner is not None and ticker.get("source") == "websocket_kline_last"
+            else time.time()
+        )
+        age = now - float(timestamp) / 1000
         if not math.isfinite(age) or abs(age) > MAX_TICKER_AGE:
             raise ValueError(
                 f"Stale market price ({age:.1f}s); paper execution rejected"
@@ -99,6 +113,27 @@ class PaperExchange:
             amount = position["amount"]
         ticker = await self.fetch_ticker(symbol)
         price = float(ticker["last"])
+        if closing and params.get("stopPrice") is not None:
+            direction = 1 if position["side"] == "buy" else -1
+            if direction * (price - float(params["stopPrice"])) > 0:
+                raise ValueError("Stop condition no longer met at execution")
+        if closing and not full_close and params.get("partialStop") is not None:
+            direction = 1 if position["side"] == "buy" else -1
+            if direction * (price - float(params["partialStop"])) <= 0:
+                raise PartialStopCrossed(price)
+        if not closing and params.get("referencePrice") is not None:
+            reference = float(params["referencePrice"])
+            if (
+                not math.isfinite(reference)
+                or reference <= 0
+                or abs(price / reference - 1) > params.get("maxDeviation", 0.003)
+            ):
+                raise ValueError("Execution price diverged from signal; entry rejected")
+        if closing and params.get("adverseLevel") is not None:
+            direction = 1 if position["side"] == "buy" else -1
+            adverse = -direction * (price / float(params["adverseEntry"]) - 1)
+            if adverse + 1e-12 < float(params["adverseLevel"]):
+                raise ValueError("Partial threshold no longer met at execution")
         if not closing and "quoteNotional" in params:
             quote = float(params["quoteNotional"])
             if not math.isfinite(quote) or quote <= 0:
@@ -165,7 +200,7 @@ class PaperExchange:
             amount=amount,
             price=price,
             market_timestamp=ticker["timestamp"],
-            price_source="binance_usdm_last",
+            price_source=ticker.get("source", "binance_usdm_rest_last"),
             reduceOnly=closing,
             fee_usdt=fee,
             pnl_usdt=pnl,
@@ -214,10 +249,18 @@ class PaperState:
         self.exchange.trades = state["trades"]
         self.positions = state["strategy_positions"]
         self.last_trade = state["last_trade"]
+        self.risk_memory = state.get(
+            "risk_memory", {"peak_balance": max(100.0, wallet)}
+        )
+        self.reversal_stats = state.get("reversal_stats", {})
         if set(self.positions) != set(self.exchange.positions):
             raise ValueError("Inconsistent saved positions")
 
     def save(self):
+        memory = getattr(self, "risk_memory", {})
+        memory["peak_balance"] = max(
+            memory.get("peak_balance", 100.0), self.exchange.balance
+        )
         state = {
             "version": 1,
             "initial_balance_usdt": 100.0,
@@ -231,6 +274,8 @@ class PaperState:
             "strategy_positions": self.positions,
             "prices": self.exchange.prices,
             "last_trade": self.last_trade,
+            "risk_memory": getattr(self, "risk_memory", {}),
+            "reversal_stats": getattr(self, "reversal_stats", {}),
             "trades": self.exchange.trades,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

@@ -154,9 +154,9 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         await self.scanner.evaluate(BTC)
         self.data.tickers = {ETH: {"quoteVolume": 40_000_000}}
         await self.scanner.refresh_universe()
-        self.assertEqual(self.scanner.symbols, (ETH,))
+        self.assertEqual(self.scanner.symbols, (ETH, BTC))
         self.assertIn(BTC, self.bot.positions)
-        self.assertIsNone(self.scanner.signal(BTC))
+        self.assertTrue(self.scanner.has_position(BTC))
         self.data.price = 105
         await self.bot.manage_exits()
         self.assertIn(BTC, self.bot.positions)

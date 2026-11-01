@@ -17,9 +17,11 @@ from config import (
     log,
 )
 from paper_runtime import PaperHunter
+from risk_controls import RiskControls
+from paper_account import PartialStopCrossed
 
 
-class Final3PaperHunter(PaperHunter):
+class Final3PaperHunter(RiskControls, PaperHunter):
     def __init__(
         self,
         state_path="paper_state_final3.json",
@@ -59,6 +61,8 @@ class Final3PaperHunter(PaperHunter):
 
     async def enter(self, symbol, side, price):
         now = time.time()
+        if not self.entry_permitted(symbol):
+            return False
         if (
             self.has_market_position(symbol)
             or len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS
@@ -77,7 +81,11 @@ class Final3PaperHunter(PaperHunter):
                 "market",
                 side,
                 1,
-                params={"quoteNotional": quote, "positionId": symbol},
+                params={
+                    "quoteNotional": quote,
+                    "positionId": symbol,
+                    **self.guarded_entry_params(price),
+                },
             )
             self.positions[symbol] = self.position(symbol, symbol, fill)
             self.last_trade[symbol] = now
@@ -105,9 +113,16 @@ class Final3PaperHunter(PaperHunter):
                 "reduceOnly": True,
                 "positionId": position_id,
                 "exit_reason": reason,
+                "stopPrice": (
+                    p["sl"]
+                    if reason
+                    in ("SL", "TIGHT_1", "TIGHT_2", "TIGHT_AFTER_REV", "PROFIT_LOCK")
+                    else None
+                ),
             },
         )
         self.exchange.trades[-1]["trigger_price"] = float(trigger_price)
+        self.last_trade[symbol] = time.time()
         del self.positions[position_id]
         self.save()
         log.info("EXIT %s %s", reason, symbol)
@@ -153,8 +168,8 @@ class Final3PaperHunter(PaperHunter):
                     )
                     if success:
                         p["partial_2_done"] = True
-                        # وقف على مسافة 0.8% من السعر الحالي، مع الحفاظ على وقف أقرب.
-                        new_sl = price * (1 - direction * 0.008)
+                        # وقف على مسافة 0.3% من السعر الحالي، مع الحفاظ على وقف أقرب.
+                        new_sl = price * (1 - direction * 0.003)
                         self.tighten_stop(p, new_sl, "TIGHT_2")
                     if symbol not in self.positions:
                         continue
@@ -162,10 +177,17 @@ class Final3PaperHunter(PaperHunter):
                 # ===== 3. نظام جني الأرباح المتحرك =====
                 for trigger, lock in PROFIT_LOCK_LEVELS:
                     if move >= trigger and p.get("profit_locked", 0) < lock:
-                        new_sl = p["entry"] * (1 + direction * lock)
+                        new_sl = self.fee_aware_stop(p, lock)
+                        if direction * (price - new_sl) <= 0:
+                            continue
                         self.tighten_stop(p, new_sl, "PROFIT_LOCK")
-                        p["profit_locked"] = lock
-                        log.info("PROFIT LOCK %s | +%.2f%% locked", symbol, lock * 100)
+                        p["profit_locked"] = direction * (p["sl"] / p["entry"] - 1)
+                        log.info(
+                            "PROFIT LOCK %s | actual=%.3f%% | stop=%.8f",
+                            symbol,
+                            p["profit_locked"] * 100,
+                            p["sl"],
+                        )
 
                 self.save()
             except Exception as error:
@@ -188,7 +210,17 @@ class Final3PaperHunter(PaperHunter):
                 "market",
                 side,
                 amount,
-                params={"reduceOnly": True, "exit_reason": reason},
+                params={
+                    "reduceOnly": True,
+                    "exit_reason": reason,
+                    "partialStop": p["sl"],
+                    "adverseEntry": p["entry"],
+                    "adverseLevel": (
+                        PARTIAL_LEVEL_1
+                        if reason == "PARTIAL_1"
+                        else PARTIAL_LEVEL_2 if reason == "PARTIAL_2" else None
+                    ),
+                },
             )
             # تحديث الكمية من الحساب الفعلي
             if symbol in self.exchange.positions:
@@ -201,6 +233,9 @@ class Final3PaperHunter(PaperHunter):
                 "%s %s | closed %.0f%% @ %.6f", reason, symbol, fraction * 100, price
             )
             self.save()
+            return True
+        except PartialStopCrossed as error:
+            await self.close_position(symbol, p.get("stop_kind", "SL"), error.price)
             return True
         except Exception as e:
             log.warning("Partial close failed %s: %s", symbol, e)

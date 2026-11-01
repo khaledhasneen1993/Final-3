@@ -102,7 +102,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         restored = Final3PaperHunter(self.path, market_data=self.data)
         self.assertEqual(restored.positions["BTC/USDT:USDT"]["sl"], 98.5)
         self.assertTrue(restored.positions["BTC/USDT:USDT"]["partial_2_done"])
-        self.assertEqual(restored.settings()["partial_stop_2"], 0.008)
+        self.assertEqual(restored.settings()["partial_stop_2"], 0.003)
         self.assertEqual(restored.settings()["partial_stop_2_basis"], "current_price")
         self.assertEqual(next(self.path.parent.glob("*.bak")).read_bytes(), before)
 

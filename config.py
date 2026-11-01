@@ -1,17 +1,18 @@
 """The sole active configuration for the approved Final-3 staged-partial bot."""
 
 import logging
+from risk_controls import RISK_PROFILE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("FINAL3")
 LEVERAGE = 50
-MAX_POSITION_PCT = 0.10
+MAX_POSITION_PCT = 0.01
 CASCADE_THRESHOLD = 0.012
 VOLUME_SPIKE = 3.5
-COOLDOWN_SEC = 8
+COOLDOWN_SEC = 300
 SCAN_INTERVAL = 600
 MAX_SYMBOLS_TO_SCAN = 40
-MAX_CONCURRENT_POSITIONS = 5
+MAX_CONCURRENT_POSITIONS = 3
 MIN_QUOTE_VOLUME = 15_000_000
 HARD_STOP_PCT = 0.028
 PARTIAL_LEVEL_1 = 0.012
@@ -31,6 +32,7 @@ PROFIT_LOCK_LEVELS = [
 
 def settings():
     return dict(
+        **RISK_PROFILE,
         mode="final3_staged_partial",
         LEVERAGE=LEVERAGE,
         MAX_POSITION_PCT=MAX_POSITION_PCT,
@@ -52,7 +54,7 @@ def settings():
         partial_level_2=PARTIAL_LEVEL_2,
         partial_frac_2=PARTIAL_FRAC_2,
         partial_stop_1=0.024,
-        partial_stop_2=0.008,
+        partial_stop_2=0.003,
         partial_stop_2_basis="current_price",
         profit_lock_levels=[list(level) for level in PROFIT_LOCK_LEVELS],
     )

@@ -21,11 +21,13 @@ class PaperHunter(PaperState):
         self.exchange = PaperExchange(public, fee_rate, leverage=config.LEVERAGE)
         self.positions = {}
         self.last_trade = {}
+        self.risk_memory = {"peak_balance": 100.0, "entries_paused": False}
         self.lock = asyncio.Lock()
         self.state_path = Path(state_path)
         if self.state_path.exists() and not reset:
             self.restore()
         self.scanner = ContinuousScanner(self, config=config)
+        self.exchange.scanner = self.scanner
 
     def settings(self):
         return config.settings()
@@ -62,7 +64,7 @@ class PaperHunter(PaperState):
             try:
                 async with self.lock:
                     await self.manage_exits()
-                await asyncio.sleep(8)
+                await asyncio.sleep(2)
             except Exception as error:
                 config.log.warning("Exit watcher failed: %s", error)
                 await asyncio.sleep(15)
@@ -73,7 +75,7 @@ class PaperHunter(PaperState):
             await self.exchange.load_markets()
             self.save()
             config.log.info(
-                "FINAL-3 APPROVED | stop=2.8%% | partial 40%% / 50%% | state=%s",
+                "FINAL-3 RISK V2 | margin=1%% | stop=2.8%% | partial 40%% / 50%% | state=%s",
                 self.state_path,
             )
             tasks = [
