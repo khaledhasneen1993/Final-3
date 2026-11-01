@@ -65,6 +65,27 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                 Final3PaperHunter(self.path, market_data=self.data)
             self.assertEqual(self.path.read_bytes(), before)
 
+    async def test_approved_old_partial_rules_upgrade_without_replaying_or_loosening(
+        self,
+    ):
+        await self.bot.enter("BTC/USDT:USDT", "buy", 100)
+        self.data.price = 98.79
+        await self.bot.manage_exits()
+        state = json.loads(self.path.read_text())
+        p = state["strategy_positions"]["BTC/USDT:USDT"]
+        p["sl"] = 98
+        state["settings"].update(partial_stop_1=0.020, partial_stop_2=0.013)
+        state["settings"]["profit_lock_levels"][0][1] = 0.0
+        self.path.write_text(json.dumps(state))
+        before = self.path.read_bytes()
+        restored = Final3PaperHunter(self.path, market_data=self.data)
+        self.assertEqual(restored.positions["BTC/USDT:USDT"]["sl"], 98)
+        self.assertTrue(restored.positions["BTC/USDT:USDT"]["partial_1_done"])
+        self.assertEqual(restored.exchange.balance, state["balance_usdt"])
+        self.assertEqual(restored.exchange.trades, state["trades"])
+        self.assertEqual(restored.settings()["partial_stop_1"], 0.024)
+        self.assertEqual(next(self.path.parent.glob("*.bak")).read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

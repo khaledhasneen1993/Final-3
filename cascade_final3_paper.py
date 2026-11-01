@@ -133,20 +133,28 @@ class Final3PaperHunter(PaperHunter):
                     await self.close_position(symbol, p.get("stop_kind", "SL"), price)
                     continue
 
-                # ===== 2. الإغلاق الجزئي المتدرج (الذكي) =====
+                # ===== 2. الإغلاق الجزئي المتدرج =====
+                # نعمل الإغلاقات الجزئية أولاً قبل سحب الوقف
                 if not p.get("partial_1_done") and adverse >= PARTIAL_LEVEL_1:
-                    await self.partial_close(symbol, PARTIAL_FRAC_1, price, "PARTIAL_1")
-                    p["partial_1_done"] = True
-                    new_sl = p["entry"] * (1 - direction * 0.020)
-                    self.tighten_stop(p, new_sl, "TIGHT_1")
+                    success = await self.partial_close(
+                        symbol, PARTIAL_FRAC_1, price, "PARTIAL_1"
+                    )
+                    if success:
+                        p["partial_1_done"] = True
+                        # سحب الوقف لمستوى أبعد شوي من مستوى الجزئي الثاني
+                        new_sl = p["entry"] * (1 - direction * 0.024)
+                        self.tighten_stop(p, new_sl, "TIGHT_1")
                     if symbol not in self.positions:
                         continue
 
                 if not p.get("partial_2_done") and adverse >= PARTIAL_LEVEL_2:
-                    await self.partial_close(symbol, PARTIAL_FRAC_2, price, "PARTIAL_2")
-                    p["partial_2_done"] = True
-                    new_sl = p["entry"] * (1 - direction * 0.013)
-                    self.tighten_stop(p, new_sl, "TIGHT_2")
+                    success = await self.partial_close(
+                        symbol, PARTIAL_FRAC_2, price, "PARTIAL_2"
+                    )
+                    if success:
+                        p["partial_2_done"] = True
+                        new_sl = p["entry"] * (1 - direction * 0.015)
+                        self.tighten_stop(p, new_sl, "TIGHT_2")
                     if symbol not in self.positions:
                         continue
 
@@ -156,7 +164,7 @@ class Final3PaperHunter(PaperHunter):
                         new_sl = p["entry"] * (1 + direction * lock)
                         self.tighten_stop(p, new_sl, "PROFIT_LOCK")
                         p["profit_locked"] = lock
-                        log.info("PROFIT LOCK %s | +%.1f%% locked", symbol, lock * 100)
+                        log.info("PROFIT LOCK %s | +%.2f%% locked", symbol, lock * 100)
 
                 self.save()
             except Exception as error:
@@ -170,7 +178,7 @@ class Final3PaperHunter(PaperHunter):
         amount = float(
             self.exchange.amount_to_precision(symbol, p["amount"] * fraction)
         )
-        if amount <= 0 or amount >= p["amount"]:
+        if amount <= 0 or amount >= p["amount"] * 0.98:
             return False
         try:
             side = "sell" if p["side"] == "buy" else "buy"
@@ -181,14 +189,15 @@ class Final3PaperHunter(PaperHunter):
                 amount,
                 params={"reduceOnly": True, "exit_reason": reason},
             )
-            p["amount"] = self.exchange.positions[symbol]["amount"]
+            # تحديث الكمية من الحساب الفعلي
+            if symbol in self.exchange.positions:
+                p["amount"] = self.exchange.positions[symbol]["amount"]
+            else:
+                # الصفقة اتقفلت بالكامل
+                if symbol in self.positions:
+                    del self.positions[symbol]
             log.info(
-                "%s %s | closed %.0f%% @ %.6f | remaining=%.4f",
-                reason,
-                symbol,
-                fraction * 100,
-                price,
-                p["amount"],
+                "%s %s | closed %.0f%% @ %.6f", reason, symbol, fraction * 100, price
             )
             self.save()
             return True

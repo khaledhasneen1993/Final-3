@@ -1,4 +1,4 @@
-"""Preserve accounts while normalizing metadata for the approved Final-3 configuration."""
+"""Preserve accounts while applying approved partial-rule updates for the approved Final-3 configuration."""
 
 import argparse
 import json
@@ -40,9 +40,22 @@ def plan(path):
     ):
         raise ValueError("Invalid account; original preserved")
     if previous.get("mode") == "final3_staged_partial":
-        # Only harmless metadata naming changed; every strategy value must match.
+        # Accept only the approved previous partial rules or the current rules.
+        # Existing stops, quantities and completion flags are deliberately preserved.
         fields = set(current) - {"stop_basis"}
-        if any(previous.get(k) != current[k] for k in fields):
+        prior = dict(current)
+        prior.update(
+            partial_stop_1=0.020,
+            partial_stop_2=0.013,
+            profit_lock_levels=[
+                [trigger, 0.0 if index == 0 else lock]
+                for index, (trigger, lock) in enumerate(current["profit_lock_levels"])
+            ],
+        )
+        if not any(
+            all(previous.get(key) == candidate[key] for key in fields)
+            for candidate in (current, prior)
+        ):
             raise ValueError(
                 "Strategy settings differ; use another state path; original preserved"
             )
@@ -70,7 +83,7 @@ def migrate(path):
     if not changed:
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = path.with_name(path.name + ".before-metadata-update-" + stamp + ".bak")
+    backup = path.with_name(path.name + ".before-settings-update-" + stamp + ".bak")
     shutil.copy2(path, backup)
     temp = path.with_name(path.name + ".migrating")
     temp.write_text(

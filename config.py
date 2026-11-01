@@ -19,7 +19,7 @@ PARTIAL_FRAC_1 = 0.40
 PARTIAL_LEVEL_2 = 0.020
 PARTIAL_FRAC_2 = 0.50
 PROFIT_LOCK_LEVELS = [
-    (0.010, 0.000),
+    (0.010, 0.0001),
     (0.015, 0.005),
     (0.020, 0.010),
     (0.025, 0.015),
@@ -51,7 +51,7 @@ def settings():
         partial_frac_1=PARTIAL_FRAC_1,
         partial_level_2=PARTIAL_LEVEL_2,
         partial_frac_2=PARTIAL_FRAC_2,
-        partial_stop_1=0.020,
-        partial_stop_2=0.013,
+        partial_stop_1=0.024,
+        partial_stop_2=0.015,
         profit_lock_levels=[list(level) for level in PROFIT_LOCK_LEVELS],
     )
