@@ -1,4 +1,4 @@
-"""Final-3 paper runner: independent hedge positions and profit locks."""
+"""Final-3 paper runner: staged partial exits and profit locks."""
 
 import argparse
 import asyncio
@@ -23,7 +23,7 @@ def main():
             parser.exit(1, "Final-3 already running on this state file.\n")
         bot = Final3PaperHunter(args.state)
         log.warning(
-            "FINAL-3 PAPER | 10%% initial | 3%% stop | 60%% reversal | profit locks | paper hedge account"
+            "FINAL-3 PAPER | 10%% initial | 2.8%% stop | staged partial exits | profit locks"
         )
         try:
             asyncio.run(bot.start())

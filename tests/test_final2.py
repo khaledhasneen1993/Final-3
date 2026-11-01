@@ -1,234 +1,151 @@
-"""Current Final-3 hard-stop, profit-lock and hedge behavior (offline)."""
+"""Characterize the requested staged-partial rules, including their stated limitations."""
 
-import copy
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
-
-from cascade_final2_paper import Final2PaperHunter, PROFIT_LOCK_LEVELS
+from cascade_final2_paper import Final2PaperHunter
 from fixtures import DynamicPublicData
 
 S = "BTC/USDT:USDT"
 
 
-class Final2Tests(unittest.IsolatedAsyncioTestCase):
+class PartialTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.data = DynamicPublicData()
         self.path = Path(self.tmp.name) / "state.json"
         self.bot = Final2PaperHunter(self.path, market_data=self.data)
-        self.bot.detect_cascade = AsyncMock(
-            return_value={"long": False, "short": False}
-        )
 
     async def entry(self, side="buy"):
         self.data.price = 100
         self.assertTrue(await self.bot.enter(S, side, 100))
 
-    async def hedge(self, side="buy"):
-        await self.entry(side)
-        self.data.price = 98.2 if side == "buy" else 101.8
-        self.bot.detect_cascade.return_value = {
-            "long": side == "sell",
-            "short": side == "buy",
-        }
-        await self.bot.manage_exits()
-        child = next(k for k in self.bot.positions if k != S)
-        return child
-
-    async def test_initial_margin_fill_basis_and_three_percent_stop(self):
-        self.data.price = 101
-        self.assertTrue(await self.bot.enter(S, "buy", 99))
-        p = self.bot.positions[S]
-        self.assertEqual(p["entry"], 101)
-        self.assertAlmostEqual(p["sl"], 101 * 0.97)
-        self.assertAlmostEqual(self.bot.exchange.used, 10, places=2)
-        self.assertIsNone(p["tp"])
-        self.assertEqual(self.bot.settings()["STOP_LOSS_PCT"], 0.03)
-        self.assertEqual(self.bot.settings()["MAX_CONCURRENT_POSITIONS"], 5)
-
-    async def test_all_profit_locks_both_directions_and_never_loosen(self):
+    async def test_initial_fields_and_hard_stop_both_sides(self):
         for side in ["buy", "sell"]:
             self.bot = Final2PaperHunter(
                 Path(self.tmp.name) / (side + ".json"), market_data=self.data
             )
             await self.entry(side)
-            direction = 1 if side == "buy" else -1
-            for trigger, lock in PROFIT_LOCK_LEVELS:
-                self.data.price = 100 * (1 + direction * trigger)
-                await self.bot.manage_exits()
-                self.assertAlmostEqual(
-                    self.bot.positions[S]["sl"], 100 * (1 + direction * lock)
-                )
-                self.assertEqual(self.bot.positions[S]["stop_kind"], "PROFIT_LOCK")
-            stop = self.bot.positions[S]["sl"]
-            self.data.price = 100 * (1 + direction * 0.035)
-            await self.bot.manage_exits()
-            self.assertEqual(self.bot.positions[S]["sl"], stop)
+            p = self.bot.positions[S]
+            self.assertAlmostEqual(p["sl"], 97.2 if side == "buy" else 102.8)
+            self.assertFalse(p["partial_1_done"])
+            self.assertFalse(p["partial_2_done"])
+            self.assertEqual(p["original_notional"], 500)
+            self.assertEqual(self.bot.settings()["STOP_LOSS_PCT"], 0.028)
+            self.assertFalse(self.bot.settings()["hedge_positions"])
 
-    async def test_first_one_percent_level_sets_price_break_even(self):
+    async def test_first_partial_40_percent_once_and_margin_release(self):
+        await self.entry()
+        self.data.price = 98.79
+        await self.bot.manage_exits()
+        p = self.bot.positions[S]
+        self.assertEqual(p["amount"], 3)
+        self.assertEqual(self.bot.exchange.used, 6)
+        self.assertTrue(p["partial_1_done"])
+        self.assertFalse(p["partial_2_done"])
+        self.assertEqual(p["sl"], 98)
+        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "PARTIAL_1")
+        n = len(self.bot.exchange.trades)
+        await self.bot.manage_exits()
+        self.assertEqual(len(self.bot.exchange.trades), n)
+
+    async def test_short_partial_uses_same_fraction(self):
+        await self.entry("sell")
+        self.data.price = 101.21
+        await self.bot.manage_exits()
+        self.assertEqual(self.bot.positions[S]["amount"], 3)
+        self.assertEqual(self.bot.positions[S]["sl"], 102)
+
+    async def test_hard_stop_has_priority_before_any_partial(self):
+        await self.entry()
+        self.data.price = 97.1
+        await self.bot.manage_exits()
+        self.assertFalse(self.bot.positions)
+        self.assertEqual(len(self.bot.exchange.trades), 2)
+        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "SL")
+
+    async def test_gradual_decline_hits_tight_stop_before_second_partial(self):
+        await self.entry()
+        self.data.price = 98.79
+        await self.bot.manage_exits()
+        self.data.price = 98
+        await self.bot.manage_exits()
+        self.assertFalse(self.bot.positions)
+        self.assertEqual(
+            [f.get("exit_reason") for f in self.bot.exchange.trades[1:]],
+            ["PARTIAL_1", "TIGHT_1"],
+        )
+
+    async def test_jump_can_execute_both_partials_then_stop_next_pass(self):
+        await self.entry()
+        self.data.price = 97.9
+        await self.bot.manage_exits()
+        p = self.bot.positions[S]
+        self.assertEqual(p["amount"], 1.5)
+        self.assertTrue(p["partial_1_done"])
+        self.assertTrue(p["partial_2_done"])
+        self.assertEqual(p["sl"], 98.7)
+        self.assertEqual(
+            [f.get("exit_reason") for f in self.bot.exchange.trades[1:]],
+            ["PARTIAL_1", "PARTIAL_2"],
+        )
+        await self.bot.manage_exits()
+        self.assertFalse(self.bot.positions)
+        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "TIGHT_2")
+
+    async def test_profit_locks_and_supplied_zero_level_condition(self):
         await self.entry()
         self.data.price = 101
         await self.bot.manage_exits()
-        self.assertEqual(self.bot.positions[S]["sl"], 100)
-        self.data.price = 99.99
+        self.assertAlmostEqual(self.bot.positions[S]["sl"], 97.2)
+        self.data.price = 102
         await self.bot.manage_exits()
-        self.assertFalse(self.bot.positions)
-        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "PROFIT_LOCK")
-
-    async def test_both_hedge_directions_have_separate_margin_and_market_symbol(self):
-        for side in ["buy", "sell"]:
-            self.bot = Final2PaperHunter(
-                Path(self.tmp.name) / (side + ".json"), market_data=self.data
-            )
-            self.bot.detect_cascade = AsyncMock()
-            child = await self.hedge(side)
-            self.assertEqual(len(self.bot.exchange.positions), 2)
-            self.assertNotEqual(
-                self.bot.positions[S]["side"], self.bot.positions[child]["side"]
-            )
-            f = self.bot.exchange.positions[child]
-            self.assertEqual(f["symbol"], S)
-            self.assertAlmostEqual(f["entry"] * f["amount"], 300, delta=0.11)
-            self.assertAlmostEqual(self.bot.exchange.used, 16, delta=0.01)
-            self.assertTrue(self.bot.positions[child]["is_reversal"])
-            self.assertTrue(self.bot.positions[S]["reversed"])
-            expected = self.bot.exchange.balance + sum(
-                (self.data.price - p["entry"])
-                * p["amount"]
-                * (1 if p["side"] == "buy" else -1)
-                for p in self.bot.exchange.positions.values()
-            )
-            self.assertAlmostEqual(self.bot.exchange.equity, expected)
-
-    async def test_success_closes_parent_keeps_child_and_independent_ledger(self):
-        child = await self.hedge()
-        self.data.price = 97.02
+        self.assertEqual(self.bot.positions[S]["sl"], 101)
+        self.data.price = 101.5
         await self.bot.manage_exits()
-        self.assertNotIn(S, self.bot.positions)
-        self.assertIn(child, self.bot.positions)
-        self.assertFalse(self.bot.positions[child]["is_reversal"])
-        self.assertIsNone(self.bot.positions[child]["parent"])
-        self.assertEqual(self.bot.exchange.trades[-1]["position_id"], S)
-        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "REVERSAL_WIN")
-        self.assertTrue(self.bot.has_market_position(S))
-        self.bot.last_trade.clear()
-        self.assertFalse(await self.bot.enter(S, "buy", self.data.price))
-        from continuous_scanner import ContinuousScanner
+        self.assertEqual(self.bot.positions[S]["sl"], 101)
 
-        self.assertTrue(ContinuousScanner(self.bot).has_position(S))
-
-    async def test_child_stop_does_not_close_parent_or_open_another_child(self):
-        child = await self.hedge()
-        self.data.price = 101.2
-        await self.bot.manage_exits()
-        self.assertIn(S, self.bot.positions)
-        self.assertNotIn(child, self.bot.positions)
-        self.assertTrue(self.bot.positions[S]["reversed"])
-        self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.2, self.bot.positions[S])
-        )
-        self.assertEqual(len(self.bot.exchange.trades), 3)
-        self.assertEqual(self.bot.exchange.trades[-1]["position_id"], child)
-
-    async def test_close_parent_directly_preserves_and_promotes_child(self):
-        child = await self.hedge()
-        await self.bot.close_position(S, "SL", self.data.price)
-        self.assertEqual(set(self.bot.positions), {child})
-        self.assertFalse(self.bot.positions[child]["is_reversal"])
-
-    async def test_confirmation_does_not_happen_below_one_point_two(self):
-        child = await self.hedge()
-        self.data.price = self.bot.positions[child]["entry"] * 0.989
-        await self.bot.manage_exits()
-        self.assertEqual(len(self.bot.positions), 2)
-
-    async def test_reversal_needs_opposite_signal_and_capacity(self):
+    async def test_restore_preserves_partial_flags_and_amount(self):
         await self.entry()
-        self.data.price = 98.2
+        self.data.price = 98.79
         await self.bot.manage_exits()
-        self.assertEqual(len(self.bot.positions), 1)
-        self.bot.detect_cascade.return_value = {"long": False, "short": True}
-        for i in range(4):
-            key = f"OTHER{i}"
-            self.bot.positions[key] = {"symbol": key}
-        self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.2, self.bot.positions[S])
-        )
-        self.assertEqual(len(self.bot.exchange.trades), 1)
+        restored = Final2PaperHunter(self.path, market_data=self.data)
+        self.assertEqual(restored.positions, self.bot.positions)
+        await restored.manage_exits()
+        self.assertEqual(len(restored.exchange.trades), 2)
 
-    async def test_insufficient_margin_does_not_mark_reversed(self):
-        await self.entry()
-        self.bot.exchange.balance = 10.1
-        self.data.price = 98.2
-        self.bot.detect_cascade.return_value = {"long": False, "short": True}
-        self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.2, self.bot.positions[S])
-        )
-        self.assertFalse(self.bot.positions[S]["reversed"])
-        self.assertEqual(len(self.bot.exchange.positions), 1)
-
-    async def test_gap_past_stop_before_reversal_fill_closes_original(self):
+    async def test_partial_failure_keeps_amount_but_supplied_loop_marks_done(self):
         await self.entry()
         calls = 0
 
         async def ticker(symbol):
             nonlocal calls
-            self.assertEqual(symbol, S)
             calls += 1
-            return {"last": 98.2 if calls == 1 else 96, "timestamp": time.time() * 1000}
+            return {
+                "last": 98.79,
+                "timestamp": (time.time() - (60 if calls > 1 else 0)) * 1000,
+            }
 
         self.data.fetch_ticker = ticker
-        self.bot.detect_cascade.return_value = {"long": False, "short": True}
         await self.bot.manage_exits()
-        self.assertFalse(self.bot.positions)
-        self.assertEqual(len(self.bot.exchange.trades), 2)
-        self.assertTrue(self.bot.exchange.trades[-1]["reduceOnly"])
-
-    async def test_rebound_before_fill_cancels_reversal(self):
-        await self.entry()
-        self.data.price = 100
-        self.bot.detect_cascade.return_value = {"long": False, "short": True}
-        self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.2, self.bot.positions[S])
-        )
-        self.assertFalse(self.bot.positions[S]["reversed"])
+        self.assertEqual(self.bot.positions[S]["amount"], 5)
+        self.assertTrue(self.bot.positions[S]["partial_1_done"])
         self.assertEqual(len(self.bot.exchange.trades), 1)
 
-    async def test_restore_both_sides_and_no_synthetic_tickers(self):
-        child = await self.hedge()
-        self.bot.save()
-        restored = Final2PaperHunter(self.path, market_data=self.data)
-        self.assertEqual(restored.positions, self.bot.positions)
-        self.assertEqual(restored.exchange.positions, self.bot.exchange.positions)
-        restored.detect_cascade = AsyncMock(return_value=None)
-        original = self.data.fetch_ticker
-
-        async def checked(symbol):
-            self.assertEqual(symbol, S)
-            return await original(symbol)
-
-        self.data.fetch_ticker = checked
-        await restored.manage_exits()
-        self.assertEqual(len(restored.exchange.trades), 2)
-
-    async def test_stale_reversal_fill_does_not_mutate_account(self):
+    async def test_no_reversal_or_scale_in(self):
         await self.entry()
-        before = copy.deepcopy(self.bot.exchange.positions)
-
-        async def stale(symbol):
-            return {"last": 98.2, "timestamp": (time.time() - 30) * 1000}
-
-        self.data.fetch_ticker = stale
-        self.bot.detect_cascade.return_value = {"long": False, "short": True}
+        self.data.price = 98.1
+        self.bot.detect_cascade = AsyncMock(return_value={"short": True})
+        await self.bot.manage_exits()
+        self.bot.detect_cascade.assert_not_awaited()
+        self.assertEqual(len(self.bot.positions), 1)
         self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.2, self.bot.positions[S])
+            await self.bot.try_open_reversal(S, 98.1, self.bot.positions[S])
         )
-        self.assertEqual(self.bot.exchange.positions, before)
-        self.assertFalse(self.bot.positions[S]["reversed"])
+        self.assertFalse(hasattr(self.bot, "add_position"))
 
 
 if __name__ == "__main__":

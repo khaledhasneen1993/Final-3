@@ -69,10 +69,15 @@ def previous_final3_settings():
 
 
 def unfinished_reversal_settings():
-    settings = current_settings().copy()
-    settings.pop("hedge_positions")
-    settings["TAKE_PROFIT_PCT"] = 0.018
-    return settings
+    from migrate_reversal_state import unfinished_reversal_settings as previous
+
+    return previous()
+
+
+def approved_reversal_settings():
+    from migrate_reversal_state import current_settings as previous
+
+    return previous()
 
 
 def plan(path):
@@ -89,6 +94,7 @@ def plan(path):
         previous_protection_settings(),
         old_scale_settings(),
         unfinished_reversal_settings(),
+        approved_reversal_settings(),
     ]
     if previous not in allowed:
         raise ValueError("Unrecognized state settings; original preserved")
@@ -100,9 +106,9 @@ def plan(path):
         or set(accounts) != set(positions)
     ):
         raise ValueError("Inconsistent positions; original preserved")
-    if accounts and previous != unfinished_reversal_settings():
+    if accounts:
         raise ValueError(
-            "Old scale-in positions are open. Resume the old version or use a NEW --state/session; original preserved"
+            "Previous-strategy positions are open. Resume their matching version or use a NEW --state/session; original preserved"
         )
     wallet = state.get("balance_usdt")
     if (
@@ -121,40 +127,6 @@ def plan(path):
             if not math.isclose(float(state.get(key, math.nan)), value, abs_tol=1e-8):
                 raise ValueError("Inconsistent idle wallet; original preserved")
     state = copy.deepcopy(state)
-    for key, fill in state["account_positions"].items():
-        p = state["strategy_positions"][key]
-        if (
-            p.get("is_reversal")
-            or p.get("reversed")
-            or fill.get("side") != p.get("side")
-        ):
-            raise ValueError(
-                "Unsupported unfinished reversal state; original preserved"
-            )
-        if any(
-            not isinstance(fill.get(k), (int, float))
-            or not math.isfinite(fill[k])
-            or fill[k] <= 0
-            for k in ["entry", "amount", "margin"]
-        ):
-            raise ValueError("Invalid position; original preserved")
-        fill.update(symbol=key, position_id=key)
-        p.update(
-            symbol=key,
-            position_id=key,
-            is_reversal=False,
-            parent=None,
-            reverse_of=None,
-            tp=None,
-        )
-        p["profit_lock_trigger"] = max(
-            (
-                t
-                for t, l in current["profit_lock_levels"]
-                if l > 0 and l <= p.get("profit_locked", 0)
-            ),
-            default=0,
-        )
     state["settings"] = current
     return state, True
 

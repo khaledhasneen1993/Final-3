@@ -6,7 +6,7 @@ from cascade_final2_paper import Final2PaperHunter
 
 class RemovedScaleInTests(unittest.TestCase):
     def test_legacy_scale_methods_removed(self):
-        for name in ("add_position", "partial_close", "apply_tight_stop"):
+        for name in ("add_position", "apply_tight_stop"):
             self.assertFalse(hasattr(Final2PaperHunter, name))
 
 
