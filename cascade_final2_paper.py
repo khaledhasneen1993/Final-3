@@ -1,20 +1,25 @@
-"""Final-3: equal-notional scale-in, post-add protection and profit trailing."""
+"""Final-3: hard stop, profit locks and signal-confirmed reversal."""
 import argparse
 import asyncio
-import math
 from pathlib import Path
+
 from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter
 from binance_cascade_hunter_dynamic_v2 import log
-from paper_account import PartialStopCrossed
 
-ADD_LEVELS = (0.025,)
-ADD_FRACTION = 1.0
-TRAIL_ACTIVATION = 0.018
-TRAIL_DISTANCE = 0.009
-TARGET_STEP = 0.005
-POST_ADD_STOP_PCT = 0.04
-PARTIAL_ADVERSE_PCT = 0.03
-PARTIAL_CLOSE_FRACTION = 0.50
+HARD_STOP_PCT = 0.03
+REVERSAL_TRIGGER = 0.018
+REVERSAL_SIZE_MULT = 0.60
+REVERSAL_CONFIRM_PROFIT = 0.012
+
+PROFIT_LOCK_LEVELS = [
+    (0.010, 0.000),
+    (0.015, 0.005),
+    (0.020, 0.010),
+    (0.025, 0.015),
+    (0.030, 0.020),
+    (0.035, 0.025),
+    (0.040, 0.030),
+]
 
 
 class Final2PaperHunter(V2PaperHunter):
@@ -26,70 +31,54 @@ class Final2PaperHunter(V2PaperHunter):
             if backup:
                 log.info('Risk settings migrated; original state backed up: %s', backup)
         super().__init__(state_path, fee_rate, reset, market_data)
-        for symbol, p in self.positions.items():
-            fill = self.exchange.positions[symbol]
-            fill.setdefault('fees_paid', fill['entry'] * fill['amount'] * self.exchange.fee_rate)
-            fill.setdefault('realized_pnl', 0.0)
-            p.setdefault('partial_done', False)
-            p.setdefault('break_even_armed', False)
-            p.setdefault('stop_kind', 'TRAIL_SL' if p.get('trailing') else 'SL')
-            if p.get('adds_done'):
-                self.apply_tight_stop(p)
 
     def settings(self):
-        return {**super().settings(), 'mode':'final3_scale_trail',
-                'add_levels':list(ADD_LEVELS), 'add_fraction':ADD_FRACTION,
-                'add_basis':'original_fill_notional', 'stop_basis':'original_fill_price',
-                'trail_activation':TRAIL_ACTIVATION, 'trail_distance':TRAIL_DISTANCE,
-                'target_step':TARGET_STEP, 'post_add_stop':POST_ADD_STOP_PCT,
-                'partial_adverse':PARTIAL_ADVERSE_PCT, 'partial_fraction':PARTIAL_CLOSE_FRACTION,
-                'break_even_after_add':True}
+        return {
+            **super().settings(),
+            'mode': 'final3_smart_reversal',
+            'STOP_LOSS_PCT': HARD_STOP_PCT,
+            'hard_stop_pct': HARD_STOP_PCT,
+            'reversal_trigger': REVERSAL_TRIGGER,
+            'reversal_size_mult': REVERSAL_SIZE_MULT,
+            'reversal_confirm_profit': REVERSAL_CONFIRM_PROFIT,
+            'profit_lock_levels': [list(level) for level in PROFIT_LOCK_LEVELS],
+        }
 
     async def enter(self, symbol, side, price):
         if symbol in self.positions:
             return False
         if not await super().enter(symbol, side, price):
             return False
-        p=self.positions[symbol]
-        fill=self.exchange.positions[symbol]
-        p.update(original_entry=fill['entry'], original_notional=fill['entry']*fill['amount'],
-                 initial_sl=fill['entry']*(1-self.strategy.STOP_LOSS_PCT if side=='buy'
-                                        else 1+self.strategy.STOP_LOSS_PCT),
-                 adds_done=0, trailing=False, best_price=fill['entry'],
-                 entry=fill['entry'], amount=fill['amount'], partial_done=False,
-                 break_even_armed=False, stop_kind='SL')
-        p['sl']=p['initial_sl']
-        p['tp']=p['entry']*(1+TRAIL_ACTIVATION if side=='buy' else 1-TRAIL_ACTIVATION)
+        p = self.positions[symbol]
+        fill = self.exchange.positions[symbol]
+        p.update(
+            original_entry=fill['entry'],
+            original_notional=fill['entry'] * fill['amount'],
+            initial_sl=fill['entry'] * (1 - HARD_STOP_PCT if side == 'buy' else 1 + HARD_STOP_PCT),
+            adds_done=0,
+            trailing=False,
+            best_price=fill['entry'],
+            entry=fill['entry'],
+            amount=fill['amount'],
+            reversed=False,
+            reverse_of=None,
+            profit_locked=0.0,
+            stop_kind='SL'
+        )
+        p['sl'] = p['initial_sl']
         self.save()
         return True
 
     async def close_position(self, symbol, reason, trigger_price):
-        p=self.positions[symbol]
-        await self.exchange.create_order(symbol,'market','sell' if p['side']=='buy' else 'buy',
-                                         p['amount'],params={'reduceOnly':True, 'exit_reason':reason})
-        self.record_exit_reason(symbol,reason,trigger_price)
+        p = self.positions[symbol]
+        await self.exchange.create_order(
+            symbol, 'market', 'sell' if p['side'] == 'buy' else 'buy',
+            p['amount'], params={'reduceOnly': True, 'exit_reason': reason}
+        )
+        self.record_exit_reason(symbol, reason, trigger_price)
         del self.positions[symbol]
         self.save()
-        log.info('EXIT %s %s @ %.8f',reason,symbol,trigger_price)
-
-    async def add_position(self,symbol,price):
-        p=self.positions[symbol]
-        if p['adds_done'] >= len(ADD_LEVELS) or p.get('trailing'):
-            return False
-        amount=float(self.exchange.amount_to_precision(symbol,p['original_notional']*ADD_FRACTION/price))
-        if amount<=0:
-            return False
-        # PaperExchange enforces market limits, free margin and fees before mutation.
-        await self.exchange.create_order(symbol,'market',p['side'],amount,params={'scaleIn':True})
-        fill=self.exchange.positions[symbol]
-        p.update(entry=fill['entry'],amount=fill['amount'],adds_done=p['adds_done']+1)
-        p['tp']=p['entry']*(1+TRAIL_ACTIVATION if p['side']=='buy' else 1-TRAIL_ACTIVATION)
-        self.apply_tight_stop(p)
-        self.exchange.trades[-1].update(stop_loss_price=p['sl'], entry_reason='SCALE_IN',add_level=ADD_LEVELS[p['adds_done']-1],
-                                       original_notional=p['original_notional'])
-        self.save()
-        log.info('SCALE IN %s level=%d average=%.8f',symbol,p['adds_done'],p['entry'])
-        return True
+        log.info('EXIT %s %s @ %.8f', reason, symbol, trigger_price)
 
     @staticmethod
     def tighten_stop(p, candidate, kind):
@@ -97,98 +86,126 @@ class Final2PaperHunter(V2PaperHunter):
         if improves:
             p['sl'], p['stop_kind'] = candidate, kind
 
-    def apply_tight_stop(self, p):
-        direction = 1 if p['side'] == 'buy' else -1
-        self.tighten_stop(p, p['entry'] * (1-direction*POST_ADD_STOP_PCT), 'TIGHT_SL')
-
-    def break_even_price(self, symbol):
-        fill = self.exchange.positions[symbol]
-        direction = 1 if fill['side'] == 'buy' else -1
-        amount = fill['amount']
-        return (direction*fill['entry']*amount + fill['fees_paid'] - fill['realized_pnl']) / (
-            amount*(direction-self.exchange.fee_rate))
-
-    async def partial_close(self, symbol, price):
-        p = self.positions[symbol]
-        if not p['adds_done'] or p.get('partial_done'):
-            return False
-        direction = 1 if p['side'] == 'buy' else -1
-        if direction*(price-p['sl']) <= 0:
-            return False
-        if -direction*(price/p['entry']-1) + 1e-12 < PARTIAL_ADVERSE_PCT:
-            return False
-        amount = float(self.exchange.amount_to_precision(symbol, p['amount']*PARTIAL_CLOSE_FRACTION))
-        if amount <= 0 or amount >= p['amount']:
-            log.warning('Partial close skipped %s: quantity too small to split', symbol)
-            return False
-        try:
-            await self.exchange.create_order(symbol, 'market', 'sell' if direction==1 else 'buy', amount,
-                params={'reduceOnly':True, 'exit_reason':'PARTIAL_RISK', 'partialStop':p['sl']})
-        except PartialStopCrossed as error:
-            await self.close_position(symbol, p.get('stop_kind','SL'), error.price)
-            return False
-        self.record_exit_reason(symbol, 'PARTIAL_RISK', price)
-        p['amount'] = self.exchange.positions[symbol]['amount']
-        p['partial_done'] = True
-        self.save()
-        log.info('PARTIAL_RISK %s | remaining=%.8f', symbol, p['amount'])
-        return True
-
     async def manage_exits(self):
-        for symbol,p in list(self.positions.items()):
+        for symbol, p in list(self.positions.items()):
             try:
-                price=float((await self.exchange.fetch_ticker(symbol))['last'])
-                direction=1 if p['side']=='buy' else -1
-                if p['adds_done']:
-                    self.apply_tight_stop(p)
-                if direction*(price-p['sl'])<=0:
-                    await self.close_position(symbol,p.get('stop_kind','SL'),price)
+                price = float((await self.exchange.fetch_ticker(symbol))['last'])
+                direction = 1 if p['side'] == 'buy' else -1
+                move = direction * (price / p['entry'] - 1)
+
+                # Hard Stop 3%
+                if direction * (price - p['sl']) <= 0:
+                    await self.close_position(symbol, p.get('stop_kind', 'SL'), price)
                     continue
-                adverse=-direction*(price/p['original_entry']-1)
-                if not p['trailing'] and not p['adds_done'] and adverse+1e-12>=ADD_LEVELS[0]:
-                    await self.add_position(symbol,price)
-                if direction*(price-p['sl'])<=0:
-                    await self.close_position(symbol,p.get('stop_kind','SL'),price)
-                    continue
-                if p['adds_done']:
-                    await self.partial_close(symbol,price)
-                    if symbol not in self.positions:
-                        continue
-                    break_even = self.break_even_price(symbol)
-                    p['break_even_price'] = break_even
-                    if math.isfinite(break_even) and direction*(price-break_even)>1e-12:
-                        self.tighten_stop(p,break_even,'BE_SL')
-                        p['break_even_armed']=True
-                gain=direction*(price/p['entry']-1)
-                if not p['trailing'] and gain+1e-12>=TRAIL_ACTIVATION:
-                    p['trailing']=True
-                    p['best_price']=price
-                if p['trailing']:
-                    p['best_price']=max(p['best_price'],price) if direction==1 else min(p['best_price'],price)
-                    best=p['best_price']
-                    self.tighten_stop(p,best*(1-direction*TRAIL_DISTANCE),'TRAIL_SL')
-                    gain=direction*(best/p['entry']-1)
-                    steps=max(1,math.floor((gain-TRAIL_ACTIVATION)/TARGET_STEP)+1)
-                    p['tp']=p['entry']*(1+direction*(TRAIL_ACTIVATION+steps*TARGET_STEP))
+
+                # Profit Lock System
+                for trigger, lock in PROFIT_LOCK_LEVELS:
+                    if move >= trigger and p.get('profit_locked', 0) < lock:
+                        new_sl = p['entry'] * (1 + direction * lock)
+                        self.tighten_stop(p, new_sl, 'PROFIT_LOCK')
+                        p['profit_locked'] = lock
+                        log.info('PROFIT LOCK %s | locked +%.1f%%', symbol, lock * 100)
+
+                # Smart Reversal
+                adverse = -direction * (price / p['original_entry'] - 1)
+                if not p.get('reversed') and adverse >= REVERSAL_TRIGGER:
+                    await self.try_open_reversal(symbol, price, p)
+
+                # Check if reversal position became successful
+                if p.get('reversed') and p.get('reverse_of'):
+                    await self.check_reversal_success(symbol, price)
+
                 self.save()
             except Exception as error:
-                log.warning('Position management failed %s: %s',symbol,error)
+                log.warning('Position management failed %s: %s', symbol, error)
                 self.save()
 
+    async def try_open_reversal(self, symbol, price, original_pos):
+        """فتح صفقة معاكسة بحجم 60% عند انعكاس 1.8% مع وجود إشارة معاكسة"""
+        if original_pos.get('reversed'):
+            return False
 
+        reverse_side = 'sell' if original_pos['side'] == 'buy' else 'buy'
+
+        # نتحقق من وجود إشارة معاكسة حقيقية
+        sig = await self.detect_cascade(symbol) if hasattr(self, 'detect_cascade') else None
+        if sig is None:
+            return False
+
+        has_signal = (reverse_side == 'buy' and sig.get('long')) or (reverse_side == 'sell' and sig.get('short'))
+        if not has_signal:
+            return False
+
+        amount = float(self.exchange.amount_to_precision(
+            symbol, original_pos['original_notional'] * REVERSAL_SIZE_MULT / price
+        ))
+        if amount <= 0:
+            return False
+
+        try:
+            await self.exchange.create_order(symbol, 'market', reverse_side, amount)
+            fill = self.exchange.positions.get(symbol)
+            if not fill:
+                return False
+
+            # نسجل أن هذه صفقة انعكاس
+            original_pos['reversed'] = True
+            original_pos['reverse_side'] = reverse_side
+
+            # نضيف المركز الجديد كصفقة مستقلة
+            self.positions[symbol + '_REV'] = {
+                'side': reverse_side,
+                'entry': price,
+                'amount': amount,
+                'original_entry': price,
+                'original_notional': price * amount,
+                'sl': price * (1 - HARD_STOP_PCT if reverse_side == 'buy' else 1 + HARD_STOP_PCT),
+                'profit_locked': 0.0,
+                'reversed': False,
+                'is_reversal': True,
+                'parent': symbol,
+                'stop_kind': 'SL'
+            }
+            log.info('REVERSAL OPENED %s %s | size=%.4f @ %.6f', reverse_side.upper(), symbol, amount, price)
+            self.save()
+            return True
+        except Exception as e:
+            log.warning('Reversal failed %s: %s', symbol, e)
+            return False
+
+    async def check_reversal_success(self, symbol, price):
+        """إذا ربحت صفقة الانعكاس 1.2% نقفل الأصلية ونخلي الانعكاس هي الرئيسية"""
+        p = self.positions.get(symbol)
+        if not p or not p.get('is_reversal'):
+            return
+
+        direction = 1 if p['side'] == 'buy' else -1
+        move = direction * (price / p['entry'] - 1)
+
+        if move >= REVERSAL_CONFIRM_PROFIT:
+            parent = p.get('parent')
+            if parent and parent in self.positions:
+                await self.close_position(parent, 'REVERSAL_WIN', price)
+                log.info('REVERSAL SUCCESS | closed original %s | keeping reversal', parent)
+
+            # نحول صفقة الانعكاس لصفقة عادية
+            p['is_reversal'] = False
+            p['parent'] = None
+            self.save()
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--state',default='paper_state_final3.json')
-    parser.add_argument('--reset',action='store_true')
-    args=parser.parse_args()
-    bot=Final2PaperHunter(args.state,reset=args.reset)
-    log.warning('FINAL-2 PAPER: excludes liquidation, funding and slippage; averaging increases exposure')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state', default='paper_state_final3.json')
+    parser.add_argument('--reset', action='store_true')
+    args = parser.parse_args()
+    bot = Final2PaperHunter(args.state, reset=args.reset)
+    log.warning('FINAL-3 PAPER: hard stop 3%% | profit locks | smart reversal')
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
-        log.info("Final-2 stopped; state saved")
+        log.info('Final-3 stopped; state saved')
 
 
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    main()
