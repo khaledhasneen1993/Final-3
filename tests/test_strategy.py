@@ -80,10 +80,14 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
             ["PARTIAL_1", "PARTIAL_2"],
         )
         await self.bot.manage_exits()
+        self.assertIn(S, self.bot.positions)
+        self.assertEqual(len(self.bot.exchange.trades), 3)
+        self.data.price = 97.5
+        await self.bot.manage_exits()
         self.assertFalse(self.bot.positions)
-        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "TIGHT_2")
+        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "TIGHT_1")
 
-    async def test_jump_can_execute_both_partials_then_stop_next_pass(self):
+    async def test_jump_executes_both_partials_and_keeps_remainder_at_same_price(self):
         await self.entry()
         self.data.price = 97.9
         await self.bot.manage_exits()
@@ -91,14 +95,18 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p["amount"], 1.5)
         self.assertTrue(p["partial_1_done"])
         self.assertTrue(p["partial_2_done"])
-        self.assertEqual(p["sl"], 98.5)
+        self.assertEqual(p["sl"], 97.6)
         self.assertEqual(
             [f.get("exit_reason") for f in self.bot.exchange.trades[1:]],
             ["PARTIAL_1", "PARTIAL_2"],
         )
         await self.bot.manage_exits()
+        self.assertIn(S, self.bot.positions)
+        self.assertEqual(len(self.bot.exchange.trades), 3)
+        self.data.price = 97.5
+        await self.bot.manage_exits()
         self.assertFalse(self.bot.positions)
-        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "TIGHT_2")
+        self.assertEqual(self.bot.exchange.trades[-1]["exit_reason"], "TIGHT_1")
 
     async def test_profit_locks_include_one_percent_near_break_even(self):
         await self.entry()
@@ -194,7 +202,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.data.price = 102
         await self.bot.manage_exits()
         self.assertTrue(self.bot.positions[S]["partial_2_done"])
-        self.assertAlmostEqual(self.bot.positions[S]["sl"], 101.5)
+        self.assertAlmostEqual(self.bot.positions[S]["sl"], 102.4)
         self.assertEqual(self.bot.positions[S]["amount"], 1.5)
         self.bot = Final3PaperHunter(
             Path(self.tmp.name) / "profit-short.json", market_data=self.data
@@ -223,6 +231,40 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.bot.partial_close(S, 0.4, 100, "TEST"))
         self.assertNotIn(S, self.bot.positions)
         self.assertNotIn(S, self.bot.exchange.positions)
+
+    async def test_current_price_candidate_both_directions_keeps_position_open(self):
+        for side in ["buy", "sell"]:
+            self.bot = Final3PaperHunter(
+                Path(self.tmp.name) / (side + "-current-stop.json"),
+                market_data=self.data,
+            )
+            await self.entry(side)
+            # A restored stage-one flag may have retained the initial, weaker stop.
+            p = self.bot.positions[S]
+            p["partial_1_done"] = True
+            self.data.price = 98 if side == "buy" else 102
+            original_stop = p["sl"]
+            with patch.object(
+                self.bot, "tighten_stop", wraps=self.bot.tighten_stop
+            ) as tighten:
+                await self.bot.manage_exits()
+            candidate = self.data.price * (0.992 if side == "buy" else 1.008)
+            tighten.assert_called_with(p, candidate, "TIGHT_2")
+            expected = (
+                max(original_stop, candidate)
+                if side == "buy"
+                else min(original_stop, candidate)
+            )
+            self.assertAlmostEqual(self.bot.positions[S]["sl"], expected)
+            self.assertTrue(self.bot.positions[S]["partial_2_done"])
+            count = len(self.bot.exchange.trades)
+            await self.bot.manage_exits()
+            self.assertIn(S, self.bot.positions)
+            self.assertEqual(len(self.bot.exchange.trades), count)
+            restored = Final3PaperHunter(self.bot.state_path, market_data=self.data)
+            await restored.manage_exits()
+            self.assertIn(S, restored.positions)
+            self.assertEqual(len(restored.exchange.trades), count)
 
 
 if __name__ == "__main__":

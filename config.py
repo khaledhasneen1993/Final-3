@@ -52,6 +52,7 @@ def settings():
         partial_level_2=PARTIAL_LEVEL_2,
         partial_frac_2=PARTIAL_FRAC_2,
         partial_stop_1=0.024,
-        partial_stop_2=0.015,
+        partial_stop_2=0.008,
+        partial_stop_2_basis="current_price",
         profit_lock_levels=[list(level) for level in PROFIT_LOCK_LEVELS],
     )

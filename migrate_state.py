@@ -43,7 +43,10 @@ def plan(path):
         # Accept only the approved previous partial rules or the current rules.
         # Existing stops, quantities and completion flags are deliberately preserved.
         fields = set(current) - {"stop_basis"}
-        prior = dict(current)
+        fixed_entry_stop = dict(current)
+        fixed_entry_stop.pop("partial_stop_2_basis")
+        fixed_entry_stop["partial_stop_2"] = 0.015
+        prior = dict(fixed_entry_stop)
         prior.update(
             partial_stop_1=0.020,
             partial_stop_2=0.013,
@@ -53,8 +56,8 @@ def plan(path):
             ],
         )
         if not any(
-            all(previous.get(key) == candidate[key] for key in fields)
-            for candidate in (current, prior)
+            all(previous.get(key) == candidate.get(key) for key in fields)
+            for candidate in (current, fixed_entry_stop, prior)
         ):
             raise ValueError(
                 "Strategy settings differ; use another state path; original preserved"

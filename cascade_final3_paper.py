@@ -153,7 +153,8 @@ class Final3PaperHunter(PaperHunter):
                     )
                     if success:
                         p["partial_2_done"] = True
-                        new_sl = p["entry"] * (1 - direction * 0.015)
+                        # وقف على مسافة 0.8% من السعر الحالي، مع الحفاظ على وقف أقرب.
+                        new_sl = price * (1 - direction * 0.008)
                         self.tighten_stop(p, new_sl, "TIGHT_2")
                     if symbol not in self.positions:
                         continue
