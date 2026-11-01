@@ -1,16 +1,20 @@
-"""Final-3: hard stop, profit locks and signal-confirmed reversal."""
+"""Final-3 paper hedge positions: 3% stops, profit locks and one reversal per position."""
+
 import argparse
 import asyncio
+import math
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter
 from binance_cascade_hunter_dynamic_v2 import log
+from paper_account import ReversalStopCrossed
 
 HARD_STOP_PCT = 0.03
 REVERSAL_TRIGGER = 0.018
 REVERSAL_SIZE_MULT = 0.60
 REVERSAL_CONFIRM_PROFIT = 0.012
-
 PROFIT_LOCK_LEVELS = [
     (0.010, 0.000),
     (0.015, 0.005),
@@ -23,189 +27,254 @@ PROFIT_LOCK_LEVELS = [
 
 
 class Final2PaperHunter(V2PaperHunter):
-    def __init__(self, state_path='paper_state_final3.json', fee_rate=0.0005,
-                 reset=False, market_data=None):
+    def __init__(
+        self,
+        state_path="paper_state_final3.json",
+        fee_rate=0.0005,
+        reset=False,
+        market_data=None,
+    ):
         if Path(state_path).exists() and not reset:
             from migrate_idle_state import migrate
-            backup = migrate(state_path)
-            if backup:
-                log.info('Risk settings migrated; original state backed up: %s', backup)
+
+            migrate(state_path)
         super().__init__(state_path, fee_rate, reset, market_data)
+        for key, p in self.positions.items():
+            p.setdefault("symbol", self.exchange.positions[key].get("symbol", key))
+            p.setdefault("position_id", key)
+            p.setdefault("is_reversal", False)
+            p.setdefault("profit_lock_trigger", 0.0)
 
     def settings(self):
         return {
             **super().settings(),
-            'mode': 'final3_smart_reversal',
-            'STOP_LOSS_PCT': HARD_STOP_PCT,
-            'hard_stop_pct': HARD_STOP_PCT,
-            'reversal_trigger': REVERSAL_TRIGGER,
-            'reversal_size_mult': REVERSAL_SIZE_MULT,
-            'reversal_confirm_profit': REVERSAL_CONFIRM_PROFIT,
-            'profit_lock_levels': [list(level) for level in PROFIT_LOCK_LEVELS],
+            "mode": "final3_smart_reversal",
+            "STOP_LOSS_PCT": HARD_STOP_PCT,
+            "TAKE_PROFIT_PCT": None,
+            "hard_stop_pct": HARD_STOP_PCT,
+            "hedge_positions": True,
+            "reversal_trigger": REVERSAL_TRIGGER,
+            "reversal_size_mult": REVERSAL_SIZE_MULT,
+            "reversal_confirm_profit": REVERSAL_CONFIRM_PROFIT,
+            "profit_lock_levels": [list(level) for level in PROFIT_LOCK_LEVELS],
         }
 
-    async def enter(self, symbol, side, price):
-        if symbol in self.positions:
-            return False
-        if not await super().enter(symbol, side, price):
-            return False
-        p = self.positions[symbol]
-        fill = self.exchange.positions[symbol]
-        p.update(
-            original_entry=fill['entry'],
-            original_notional=fill['entry'] * fill['amount'],
-            initial_sl=fill['entry'] * (1 - HARD_STOP_PCT if side == 'buy' else 1 + HARD_STOP_PCT),
+    def has_market_position(self, symbol):
+        return any(p.get("symbol", key) == symbol for key, p in self.positions.items())
+
+    def position(self, key, symbol, fill):
+        side, entry = fill["side"], fill.get("entry", fill.get("price"))
+        return dict(
+            symbol=symbol,
+            position_id=key,
+            side=side,
+            entry=entry,
+            amount=fill["amount"],
+            original_entry=entry,
+            original_notional=entry * fill["amount"],
+            initial_sl=entry
+            * (1 - HARD_STOP_PCT if side == "buy" else 1 + HARD_STOP_PCT),
+            sl=entry * (1 - HARD_STOP_PCT if side == "buy" else 1 + HARD_STOP_PCT),
+            tp=None,
             adds_done=0,
             trailing=False,
-            best_price=fill['entry'],
-            entry=fill['entry'],
-            amount=fill['amount'],
+            best_price=entry,
             reversed=False,
             reverse_of=None,
+            parent=None,
+            is_reversal=False,
             profit_locked=0.0,
-            stop_kind='SL'
+            profit_lock_trigger=0.0,
+            stop_kind="SL",
         )
-        p['sl'] = p['initial_sl']
-        self.save()
-        return True
 
-    async def close_position(self, symbol, reason, trigger_price):
-        p = self.positions[symbol]
-        await self.exchange.create_order(
-            symbol, 'market', 'sell' if p['side'] == 'buy' else 'buy',
-            p['amount'], params={'reduceOnly': True, 'exit_reason': reason}
-        )
-        self.record_exit_reason(symbol, reason, trigger_price)
-        del self.positions[symbol]
-        self.save()
-        log.info('EXIT %s %s @ %.8f', reason, symbol, trigger_price)
+    async def enter(self, symbol, side, price):
+        now = time.time()
+        if (
+            self.has_market_position(symbol)
+            or len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS
+        ):
+            return False
+        if now - self.last_trade.get(symbol, -math.inf) < self.strategy.COOLDOWN_SEC:
+            return False
+        try:
+            quote = (
+                max(0.0, self.exchange.balance)
+                * self.strategy.MAX_POSITION_PCT
+                * self.strategy.LEVERAGE
+            )
+            fill = await self.exchange.create_order(
+                symbol,
+                "market",
+                side,
+                1,
+                params={"quoteNotional": quote, "positionId": symbol},
+            )
+            self.positions[symbol] = self.position(symbol, symbol, fill)
+            self.last_trade[symbol] = now
+            self.exchange.trades[-1].update(
+                entry_reason="CASCADE_MOVE_VOLUME_ORDERBOOK",
+                stop_loss_price=self.positions[symbol]["sl"],
+            )
+            self.save()
+            return True
+        except Exception as error:
+            log.warning("Entry failed %s: %s", symbol, error)
+            return False
 
     @staticmethod
     def tighten_stop(p, candidate, kind):
-        improves = candidate > p['sl'] if p['side'] == 'buy' else candidate < p['sl']
+        improves = candidate > p["sl"] if p["side"] == "buy" else candidate < p["sl"]
         if improves:
-            p['sl'], p['stop_kind'] = candidate, kind
+            p["sl"], p["stop_kind"] = candidate, kind
+
+    def promote_reversal(self, p):
+        p.update(is_reversal=False, parent=None, reverse_of=None)
+
+    async def close_position(self, position_id, reason, trigger_price):
+        p = self.positions.get(position_id)
+        if p is None:
+            return False
+        symbol = p.get("symbol", position_id)
+        await self.exchange.create_order(
+            symbol,
+            "market",
+            "sell" if p["side"] == "buy" else "buy",
+            p["amount"],
+            params={
+                "reduceOnly": True,
+                "positionId": position_id,
+                "exit_reason": reason,
+            },
+        )
+        self.exchange.trades[-1]["trigger_price"] = float(trigger_price)
+        del self.positions[position_id]
+        for child in self.positions.values():
+            if child.get("parent") == position_id:
+                self.promote_reversal(child)
+        self.save()
+        log.info("EXIT %s %s [%s]", reason, symbol, position_id)
+        return True
 
     async def manage_exits(self):
-        for symbol, p in list(self.positions.items()):
+        for key in list(self.positions):
+            p = self.positions.get(key)
+            if p is None:
+                continue
             try:
-                price = float((await self.exchange.fetch_ticker(symbol))['last'])
-                direction = 1 if p['side'] == 'buy' else -1
-                move = direction * (price / p['entry'] - 1)
-
-                # Hard Stop 3%
-                if direction * (price - p['sl']) <= 0:
-                    await self.close_position(symbol, p.get('stop_kind', 'SL'), price)
+                symbol = p.get("symbol", key)
+                price = float((await self.exchange.fetch_ticker(symbol))["last"])
+                direction = 1 if p["side"] == "buy" else -1
+                move = direction * (price / p["entry"] - 1)
+                if direction * (price - p["sl"]) <= 0:
+                    await self.close_position(key, p.get("stop_kind", "SL"), price)
                     continue
-
-                # Profit Lock System
                 for trigger, lock in PROFIT_LOCK_LEVELS:
-                    if move >= trigger and p.get('profit_locked', 0) < lock:
-                        new_sl = p['entry'] * (1 + direction * lock)
-                        self.tighten_stop(p, new_sl, 'PROFIT_LOCK')
-                        p['profit_locked'] = lock
-                        log.info('PROFIT LOCK %s | locked +%.1f%%', symbol, lock * 100)
-
-                # Smart Reversal
-                adverse = -direction * (price / p['original_entry'] - 1)
-                if not p.get('reversed') and adverse >= REVERSAL_TRIGGER:
-                    await self.try_open_reversal(symbol, price, p)
-
-                # Check if reversal position became successful
-                if p.get('reversed') and p.get('reverse_of'):
-                    await self.check_reversal_success(symbol, price)
-
+                    if move + 1e-12 >= trigger and trigger > p.get(
+                        "profit_lock_trigger", 0
+                    ):
+                        self.tighten_stop(
+                            p, p["entry"] * (1 + direction * lock), "PROFIT_LOCK"
+                        )
+                        p.update(profit_locked=lock, profit_lock_trigger=trigger)
+                        log.info(
+                            "PROFIT LOCK %s [%s] | +%.1f%%", symbol, key, lock * 100
+                        )
+                if p.get("is_reversal"):
+                    await self.check_reversal_success(key, price)
+                elif (
+                    not p.get("reversed")
+                    and -direction * (price / p["original_entry"] - 1) + 1e-12
+                    >= REVERSAL_TRIGGER
+                ):
+                    await self.try_open_reversal(key, price, p)
                 self.save()
             except Exception as error:
-                log.warning('Position management failed %s: %s', symbol, error)
+                log.warning("Position management failed %s: %s", key, error)
                 self.save()
 
-    async def try_open_reversal(self, symbol, price, original_pos):
-        """فتح صفقة معاكسة بحجم 60% عند انعكاس 1.8% مع وجود إشارة معاكسة"""
-        if original_pos.get('reversed'):
+    async def try_open_reversal(self, position_id, price, original_pos):
+        if original_pos.get("reversed") or original_pos.get("is_reversal"):
             return False
-
-        reverse_side = 'sell' if original_pos['side'] == 'buy' else 'buy'
-
-        # نتحقق من وجود إشارة معاكسة حقيقية
-        sig = await self.detect_cascade(symbol) if hasattr(self, 'detect_cascade') else None
-        if sig is None:
+        if self.positions.get(position_id) is not original_pos:
             return False
-
-        has_signal = (reverse_side == 'buy' and sig.get('long')) or (reverse_side == 'sell' and sig.get('short'))
-        if not has_signal:
+        if len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS:
             return False
-
-        amount = float(self.exchange.amount_to_precision(
-            symbol, original_pos['original_notional'] * REVERSAL_SIZE_MULT / price
-        ))
-        if amount <= 0:
+        symbol = original_pos.get("symbol", position_id)
+        reverse_side = "sell" if original_pos["side"] == "buy" else "buy"
+        sig = await self.detect_cascade(symbol)
+        if not sig or not (
+            sig.get("long") if reverse_side == "buy" else sig.get("short")
+        ):
             return False
-
+        reverse_id = symbol + "_REV_" + uuid4().hex
         try:
-            await self.exchange.create_order(symbol, 'market', reverse_side, amount)
-            fill = self.exchange.positions.get(symbol)
-            if not fill:
-                return False
-
-            # نسجل أن هذه صفقة انعكاس
-            original_pos['reversed'] = True
-            original_pos['reverse_side'] = reverse_side
-
-            # نضيف المركز الجديد كصفقة مستقلة
-            self.positions[symbol + '_REV'] = {
-                'side': reverse_side,
-                'entry': price,
-                'amount': amount,
-                'original_entry': price,
-                'original_notional': price * amount,
-                'sl': price * (1 - HARD_STOP_PCT if reverse_side == 'buy' else 1 + HARD_STOP_PCT),
-                'profit_locked': 0.0,
-                'reversed': False,
-                'is_reversal': True,
-                'parent': symbol,
-                'stop_kind': 'SL'
-            }
-            log.info('REVERSAL OPENED %s %s | size=%.4f @ %.6f', reverse_side.upper(), symbol, amount, price)
+            fill = await self.exchange.create_order(
+                symbol,
+                "market",
+                reverse_side,
+                1,
+                params={
+                    "hedge": True,
+                    "positionId": reverse_id,
+                    "hedgeParent": position_id,
+                    "parentStop": original_pos["sl"],
+                    "parentEntry": original_pos["original_entry"],
+                    "reversalTrigger": REVERSAL_TRIGGER,
+                    "quoteNotional": original_pos["original_notional"]
+                    * REVERSAL_SIZE_MULT,
+                },
+            )
+            child = self.position(reverse_id, symbol, fill)
+            child.update(is_reversal=True, parent=position_id, reverse_of=position_id)
+            self.positions[reverse_id] = child
+            original_pos.update(
+                reversed=True, reverse_side=reverse_side, reverse_position_id=reverse_id
+            )
             self.save()
+            log.info(
+                "REVERSAL %s %s [%s] | @ %.8f",
+                reverse_side,
+                symbol,
+                reverse_id,
+                fill["price"],
+            )
             return True
-        except Exception as e:
-            log.warning('Reversal failed %s: %s', symbol, e)
+        except ReversalStopCrossed as error:
+            await self.close_position(
+                position_id, original_pos.get("stop_kind", "SL"), error.price
+            )
+            return False
+        except Exception as error:
+            log.warning("Reversal failed %s: %s", symbol, error)
             return False
 
-    async def check_reversal_success(self, symbol, price):
-        """إذا ربحت صفقة الانعكاس 1.2% نقفل الأصلية ونخلي الانعكاس هي الرئيسية"""
-        p = self.positions.get(symbol)
-        if not p or not p.get('is_reversal'):
-            return
-
-        direction = 1 if p['side'] == 'buy' else -1
-        move = direction * (price / p['entry'] - 1)
-
-        if move >= REVERSAL_CONFIRM_PROFIT:
-            parent = p.get('parent')
-            if parent and parent in self.positions:
-                await self.close_position(parent, 'REVERSAL_WIN', price)
-                log.info('REVERSAL SUCCESS | closed original %s | keeping reversal', parent)
-
-            # نحول صفقة الانعكاس لصفقة عادية
-            p['is_reversal'] = False
-            p['parent'] = None
-            self.save()
+    async def check_reversal_success(self, position_id, price):
+        p = self.positions.get(position_id)
+        if not p or not p.get("is_reversal"):
+            return False
+        direction = 1 if p["side"] == "buy" else -1
+        if direction * (price / p["entry"] - 1) + 1e-12 < REVERSAL_CONFIRM_PROFIT:
+            return False
+        parent = p.get("parent")
+        if parent in self.positions:
+            await self.close_position(parent, "REVERSAL_WIN", price)
+        self.promote_reversal(p)
+        self.save()
+        return True
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--state', default='paper_state_final3.json')
-    parser.add_argument('--reset', action='store_true')
+    parser.add_argument("--state", default="paper_state_final3.json")
+    parser.add_argument("--reset", action="store_true")
     args = parser.parse_args()
     bot = Final2PaperHunter(args.state, reset=args.reset)
-    log.warning('FINAL-3 PAPER: hard stop 3%% | profit locks | smart reversal')
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
-        log.info('Final-3 stopped; state saved')
+        log.info("Final-3 stopped; state saved")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
