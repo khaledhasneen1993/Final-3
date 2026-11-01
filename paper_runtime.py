@@ -75,7 +75,7 @@ class PaperHunter(PaperState):
             await self.exchange.load_markets()
             self.save()
             config.log.info(
-                "FINAL-3 RISK V2 | margin=1%% | stop=2.8%% | partial 40%% / 50%% | state=%s",
+                "FINAL-3 RISK V2 | margin=5%% | stop=2.8%% | partial 40%% / 50%% | state=%s",
                 self.state_path,
             )
             tasks = [

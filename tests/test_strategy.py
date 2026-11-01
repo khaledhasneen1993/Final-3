@@ -33,7 +33,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(p["sl"], 97.2 if side == "buy" else 102.8)
             self.assertFalse(p["partial_1_done"])
             self.assertFalse(p["partial_2_done"])
-            self.assertEqual(p["original_notional"], 50)
+            self.assertEqual(p["original_notional"], 250)
             self.assertEqual(self.bot.settings()["STOP_LOSS_PCT"], 0.028)
             self.assertFalse(self.bot.settings()["hedge_positions"])
 
@@ -42,8 +42,8 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.data.price = 98.79
         await self.bot.manage_exits()
         p = self.bot.positions[S]
-        self.assertEqual(p["amount"], 0.3)
-        self.assertEqual(self.bot.exchange.used, 0.6)
+        self.assertEqual(p["amount"], 1.5)
+        self.assertEqual(self.bot.exchange.used, 3)
         self.assertTrue(p["partial_1_done"])
         self.assertFalse(p["partial_2_done"])
         self.assertEqual(p["sl"], 97.6)
@@ -56,7 +56,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.entry("sell")
         self.data.price = 101.21
         await self.bot.manage_exits()
-        self.assertEqual(self.bot.positions[S]["amount"], 0.3)
+        self.assertEqual(self.bot.positions[S]["amount"], 1.5)
         self.assertEqual(self.bot.positions[S]["sl"], 102.4)
 
     async def test_hard_stop_has_priority_before_any_partial(self):
@@ -73,7 +73,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.manage_exits()
         self.data.price = 98
         await self.bot.manage_exits()
-        self.assertEqual(self.bot.positions[S]["amount"], 0.15)
+        self.assertEqual(self.bot.positions[S]["amount"], 0.75)
         self.assertTrue(self.bot.positions[S]["partial_2_done"])
         self.assertEqual(
             [f.get("exit_reason") for f in self.bot.exchange.trades[1:]],
@@ -92,7 +92,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.data.price = 97.9
         await self.bot.manage_exits()
         p = self.bot.positions[S]
-        self.assertEqual(p["amount"], 0.15)
+        self.assertEqual(p["amount"], 0.75)
         self.assertTrue(p["partial_1_done"])
         self.assertTrue(p["partial_2_done"])
         self.assertEqual(p["sl"], 97.6063)
@@ -143,7 +143,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
 
         self.data.fetch_ticker = ticker
         await self.bot.manage_exits()
-        self.assertEqual(self.bot.positions[S]["amount"], 0.5)
+        self.assertEqual(self.bot.positions[S]["amount"], 2.5)
         self.assertFalse(self.bot.positions[S]["partial_1_done"])
         self.assertAlmostEqual(self.bot.positions[S]["sl"], 97.2)
         self.assertEqual(len(self.bot.exchange.trades), 1)
@@ -178,7 +178,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.data.fetch_ticker = original
         await self.bot.manage_exits()
         self.assertTrue(self.bot.positions[S]["partial_1_done"])
-        self.assertEqual(self.bot.positions[S]["amount"], 0.3)
+        self.assertEqual(self.bot.positions[S]["amount"], 1.5)
         self.assertEqual(len(self.bot.exchange.trades), 2)
 
     async def test_second_partial_failure_does_not_tighten_or_mark_second(self):
@@ -190,10 +190,10 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.manage_exits()
         self.assertFalse(self.bot.positions[S]["partial_2_done"])
         self.assertEqual(self.bot.positions[S]["sl"], 97.6)
-        self.assertEqual(self.bot.positions[S]["amount"], 0.3)
+        self.assertEqual(self.bot.positions[S]["amount"], 1.5)
         await self.bot.manage_exits()
         self.assertTrue(self.bot.positions[S]["partial_2_done"])
-        self.assertEqual(self.bot.positions[S]["amount"], 0.15)
+        self.assertEqual(self.bot.positions[S]["amount"], 0.75)
 
     async def test_short_second_partial_and_first_profit_lock(self):
         await self.entry("sell")
@@ -203,7 +203,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.manage_exits()
         self.assertTrue(self.bot.positions[S]["partial_2_done"])
         self.assertAlmostEqual(self.bot.positions[S]["sl"], 102.306)
-        self.assertEqual(self.bot.positions[S]["amount"], 0.15)
+        self.assertEqual(self.bot.positions[S]["amount"], 0.75)
         self.bot = Final3PaperHunter(
             Path(self.tmp.name) / "profit-short.json", market_data=self.data
         )
@@ -217,7 +217,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.entry()
         self.assertFalse(await self.bot.partial_close(S, 0.99, 100, "TEST"))
         self.assertFalse(await self.bot.partial_close(S, 0.00001, 100, "TEST"))
-        self.assertEqual(self.bot.positions[S]["amount"], 0.5)
+        self.assertEqual(self.bot.positions[S]["amount"], 2.5)
         self.assertEqual(len(self.bot.exchange.trades), 1)
 
     async def test_partial_handles_account_already_fully_closed(self):
@@ -225,7 +225,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         original = self.bot.exchange.create_order
 
         async def full(symbol, type, side, amount, params):
-            return await original(symbol, type, side, 0.5, params)
+            return await original(symbol, type, side, 2.5, params)
 
         with patch.object(self.bot.exchange, "create_order", side_effect=full):
             self.assertTrue(await self.bot.partial_close(S, 0.4, 100, "TEST"))

@@ -6,7 +6,7 @@ from risk_controls import RISK_PROFILE
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("FINAL3")
 LEVERAGE = 50
-MAX_POSITION_PCT = 0.01
+MAX_POSITION_PCT = 0.05
 CASCADE_THRESHOLD = 0.012
 VOLUME_SPIKE = 3.5
 COOLDOWN_SEC = 300
