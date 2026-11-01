@@ -86,34 +86,36 @@ class MigrationTests(unittest.TestCase):
 
 class VariantIsolationTests(unittest.IsolatedAsyncioTestCase):
     async def test_reversal_open_state_is_preserved_and_not_converted(self):
-        from cascade_final3_reversal import Final2PaperHunter as Reversal
+        from migrate_idle_state import approved_reversal_settings
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "reverse.json"
+            path = Path(tmp) / "previous.json"
             data = DynamicPublicData()
-            old = Reversal(path, market_data=data)
-            await old.enter("BTC/USDT:USDT", "buy", 100)
+            bot = Final2PaperHunter(path, market_data=data)
+            await bot.enter("BTC/USDT:USDT", "buy", 100)
+            state = json.loads(path.read_text())
+            state["settings"] = approved_reversal_settings()
+            path.write_text(json.dumps(state))
             before = path.read_bytes()
             with self.assertRaisesRegex(ValueError, "Previous-strategy positions"):
                 Final2PaperHunter(path, market_data=data)
             self.assertEqual(path.read_bytes(), before)
-            restored = Reversal(path, market_data=data)
-            self.assertEqual(restored.positions, old.positions)
-            self.assertEqual(restored.positions["BTC/USDT:USDT"]["sl"], 97)
 
     async def test_idle_reversal_state_can_migrate_with_backup(self):
-        from cascade_final3_reversal import Final2PaperHunter as Reversal
+        from migrate_idle_state import approved_reversal_settings
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "idle.json"
             data = DynamicPublicData()
-            old = Reversal(path, market_data=data)
-            old.exchange.balance = 105
-            old.save()
+            bot = Final2PaperHunter(path, market_data=data)
+            bot.exchange.balance = 105
+            bot.save()
+            state = json.loads(path.read_text())
+            state["settings"] = approved_reversal_settings()
+            path.write_text(json.dumps(state))
             before = path.read_bytes()
-            new = Final2PaperHunter(path, market_data=data)
-            self.assertEqual(new.exchange.balance, 105)
-            self.assertEqual(new.settings()["STOP_LOSS_PCT"], 0.028)
+            restored = Final2PaperHunter(path, market_data=data)
+            self.assertEqual(restored.exchange.balance, 105)
             self.assertEqual(next(path.parent.glob("*.bak")).read_bytes(), before)
 
 

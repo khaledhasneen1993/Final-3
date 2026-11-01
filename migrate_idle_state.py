@@ -68,16 +68,34 @@ def previous_final3_settings():
     return dict(previous_protection_settings(), STOP_LOSS_PCT=0.05)
 
 
-def unfinished_reversal_settings():
-    from migrate_reversal_state import unfinished_reversal_settings as previous
-
-    return previous()
-
-
 def approved_reversal_settings():
-    from migrate_reversal_state import current_settings as previous
+    settings = current_settings().copy()
+    for key in (
+        "partial_level_1",
+        "partial_frac_1",
+        "partial_level_2",
+        "partial_frac_2",
+        "partial_stop_1",
+        "partial_stop_2",
+    ):
+        settings.pop(key)
+    settings.update(
+        mode="final3_smart_reversal",
+        STOP_LOSS_PCT=0.03,
+        hard_stop_pct=0.03,
+        hedge_positions=True,
+        reversal_trigger=0.018,
+        reversal_size_mult=0.60,
+        reversal_confirm_profit=0.012,
+    )
+    return settings
 
-    return previous()
+
+def unfinished_reversal_settings():
+    settings = approved_reversal_settings()
+    settings.pop("hedge_positions")
+    settings["TAKE_PROFIT_PCT"] = 0.018
+    return settings
 
 
 def plan(path):

@@ -1,12 +1,13 @@
-"""Final-3 staged partial exits; the reversal variant lives in cascade_final3_reversal.py."""
+"""Final-3 staged partial exits, hard stop and profit locks."""
 
 import argparse
 import asyncio
+import math
+import time
 from pathlib import Path
 
 from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter
 from binance_cascade_hunter_dynamic_v2 import log
-from cascade_final3_reversal import Final2PaperHunter as ReversalHunter
 
 HARD_STOP_PCT = 0.028
 PARTIAL_LEVEL_1 = 0.012
@@ -25,7 +26,7 @@ PROFIT_LOCK_LEVELS = [
 ]
 
 
-class Final2PaperHunter(ReversalHunter):
+class Final2PaperHunter(V2PaperHunter):
     def __init__(
         self,
         state_path="paper_state_final3.json",
@@ -56,28 +57,85 @@ class Final2PaperHunter(ReversalHunter):
             "profit_lock_levels": [list(level) for level in PROFIT_LOCK_LEVELS],
         }
 
+    def has_market_position(self, symbol):
+        return any(p.get("symbol", key) == symbol for key, p in self.positions.items())
+
     def position(self, key, symbol, fill):
-        p = super().position(key, symbol, fill)
-        entry = p["entry"]
-        side = p["side"]
-        p.update(
-            original_entry=entry,
-            original_notional=entry * fill["amount"],
-            initial_sl=entry
-            * (1 - HARD_STOP_PCT if side == "buy" else 1 + HARD_STOP_PCT),
+        entry = fill.get("entry", fill.get("price"))
+        side = fill["side"]
+        initial_sl = entry * (1 - HARD_STOP_PCT if side == "buy" else 1 + HARD_STOP_PCT)
+        return dict(
+            symbol=symbol,
+            position_id=key,
+            side=side,
             entry=entry,
             amount=fill["amount"],
+            original_entry=entry,
+            original_notional=entry * fill["amount"],
+            initial_sl=initial_sl,
+            sl=initial_sl,
+            tp=None,
             partial_1_done=False,
             partial_2_done=False,
             profit_locked=0.0,
             stop_kind="SL",
         )
-        p["sl"] = p["initial_sl"]
-        return p
 
     async def enter(self, symbol, side, price):
-        # Shared entry uses this variant's position factory and actual fill price.
-        return await super().enter(symbol, side, price)
+        now = time.time()
+        if (
+            self.has_market_position(symbol)
+            or len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS
+        ):
+            return False
+        if now - self.last_trade.get(symbol, -math.inf) < self.strategy.COOLDOWN_SEC:
+            return False
+        try:
+            quote = (
+                max(0.0, self.exchange.balance)
+                * self.strategy.MAX_POSITION_PCT
+                * self.strategy.LEVERAGE
+            )
+            fill = await self.exchange.create_order(
+                symbol,
+                "market",
+                side,
+                1,
+                params={"quoteNotional": quote, "positionId": symbol},
+            )
+            self.positions[symbol] = self.position(symbol, symbol, fill)
+            self.last_trade[symbol] = now
+            self.exchange.trades[-1].update(
+                entry_reason="CASCADE_MOVE_VOLUME_ORDERBOOK",
+                stop_loss_price=self.positions[symbol]["sl"],
+            )
+            self.save()
+            return True
+        except Exception as error:
+            log.warning("Entry failed %s: %s", symbol, error)
+            return False
+
+    async def close_position(self, position_id, reason, trigger_price):
+        p = self.positions.get(position_id)
+        if p is None:
+            return False
+        symbol = p.get("symbol", position_id)
+        await self.exchange.create_order(
+            symbol,
+            "market",
+            "sell" if p["side"] == "buy" else "buy",
+            p["amount"],
+            params={
+                "reduceOnly": True,
+                "positionId": position_id,
+                "exit_reason": reason,
+            },
+        )
+        self.exchange.trades[-1]["trigger_price"] = float(trigger_price)
+        del self.positions[position_id]
+        self.save()
+        log.info("EXIT %s %s", reason, symbol)
+        return True
 
     @staticmethod
     def tighten_stop(p, candidate, kind):
@@ -161,9 +219,6 @@ class Final2PaperHunter(ReversalHunter):
         except Exception as e:
             log.warning("Partial close failed %s: %s", symbol, e)
             return False
-
-    async def try_open_reversal(self, *args, **kwargs):
-        return False
 
 
 def main():

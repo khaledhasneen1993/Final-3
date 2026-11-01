@@ -142,9 +142,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.manage_exits()
         self.bot.detect_cascade.assert_not_awaited()
         self.assertEqual(len(self.bot.positions), 1)
-        self.assertFalse(
-            await self.bot.try_open_reversal(S, 98.1, self.bot.positions[S])
-        )
+        self.assertFalse(hasattr(self.bot, "try_open_reversal"))
         self.assertFalse(hasattr(self.bot, "add_position"))
 
 
