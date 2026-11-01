@@ -15,7 +15,7 @@ import fcntl, sys
 sys.path.insert(0,'dashboard')
 from paths import RUNTIME, STATE_PATHS
 (RUNTIME/'data').mkdir(parents=True, exist_ok=True)
-paths = [RUNTIME/'data'/(n+'.lock') for n in ('server','final','final2','final3')]
+paths = [RUNTIME/'data'/(n+'.lock') for n in ('server','final','final3')]
 p = STATE_PATHS['final3']; p.parent.mkdir(parents=True, exist_ok=True)
 paths.append(p.with_name(p.name+'.lock'))
 for path in paths:

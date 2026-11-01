@@ -2,121 +2,68 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from migrate_idle_state import (
-    current_settings,
-    legacy_settings,
-    previous_final3_settings,
-    migrate,
-    plan,
-)
-from cascade_final2_paper import Final2PaperHunter
+from cascade_final3_paper import Final3PaperHunter
+from migrate_state import migrate, plan, current_settings
 from fixtures import DynamicPublicData
 
 
-class MigrationTests(unittest.TestCase):
-    def setUp(self):
-        self.t = tempfile.TemporaryDirectory()
-        self.addCleanup(self.t.cleanup)
-        self.path = Path(self.t.name) / "idle.json"
-        self.state = dict(
-            version=1,
-            settings=legacy_settings(),
-            fee_rate=0.0005,
-            balance_usdt=101,
-            equity_usdt=101,
-            free_usdt=101,
-            used_usdt=0,
-            account_positions={},
-            strategy_positions={},
-            prices={},
-            last_trade={},
-            trades=[{"symbol": "OLD", "id": "paper-1"}],
-        )
-        self.path.write_text(json.dumps(self.state))
+class MigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+        self.data = DynamicPublicData()
+        self.bot = Final3PaperHunter(self.path, market_data=self.data)
 
-    def test_idle_preserves_wallet_and_ledger_with_backup(self):
+    async def test_current_account_resumes_without_migration(self):
+        await self.bot.enter("BTC/USDT:USDT", "buy", 100)
         before = self.path.read_bytes()
-        backup = migrate(self.path)
-        self.assertEqual(backup.read_bytes(), before)
-        after = json.loads(self.path.read_text())
-        self.assertEqual(after, {**self.state, "settings": current_settings()})
-        bot = Final2PaperHunter(self.path, market_data=DynamicPublicData())
-        self.assertEqual(bot.exchange.balance, 101)
-        self.assertEqual(bot.exchange.trades, self.state["trades"])
         self.assertIsNone(migrate(self.path))
+        restored = Final3PaperHunter(self.path, market_data=self.data)
+        self.assertEqual(restored.positions, self.bot.positions)
+        self.assertEqual(self.path.read_bytes(), before)
 
-    def test_open_or_unknown_state_untouched(self):
-        for change in (
-            {"account_positions": {"BTC": {}}},
-            {"strategy_positions": {"BTC": {}}},
-            {"settings": {"mode": "different"}},
-            {"used_usdt": 1},
-        ):
-            self.path.write_text(json.dumps({**self.state, **change}))
-            before = self.path.read_bytes()
-            with self.assertRaises(ValueError):
-                migrate(self.path)
-            self.assertEqual(self.path.read_bytes(), before)
-
-    def test_plan_does_not_write(self):
+    async def test_old_partial_metadata_upgrade_preserves_active_positions(self):
+        await self.bot.enter("BTC/USDT:USDT", "buy", 100)
+        state = json.loads(self.path.read_text())
+        state["settings"]["stop_basis"] = "signal_price"
+        self.path.write_text(json.dumps(state))
         before = self.path.read_bytes()
         _, changed = plan(self.path)
         self.assertTrue(changed)
-        self.assertEqual(before, self.path.read_bytes())
-
-    def test_final3_five_percent_idle_wallet_and_fills_preserved(self):
-        self.state["settings"] = previous_final3_settings()
-        self.path.write_text(json.dumps(self.state))
-        before = self.path.read_bytes()
-        backup = migrate(self.path)
-        self.assertEqual(backup.read_bytes(), before)
-        after = json.loads(self.path.read_text())
-        self.assertEqual(after, {**self.state, "settings": current_settings()})
-        self.assertEqual(after["settings"]["STOP_LOSS_PCT"], 0.028)
-
-    def test_final3_five_percent_open_state_rejected(self):
-        self.state["settings"] = previous_final3_settings()
-        self.state["strategy_positions"] = {"BTC": {"sl": 95}}
-        self.path.write_text(json.dumps(self.state))
-        before = self.path.read_bytes()
-        with self.assertRaises(ValueError):
-            migrate(self.path)
         self.assertEqual(self.path.read_bytes(), before)
+        restored = Final3PaperHunter(self.path, market_data=self.data)
+        after = json.loads(self.path.read_text())
+        self.assertEqual(after, {**state, "settings": current_settings()})
+        self.assertEqual(restored.positions, self.bot.positions)
+        self.assertEqual(next(self.path.parent.glob("*.bak")).read_bytes(), before)
 
+    async def test_old_idle_account_keeps_wallet_and_trades(self):
+        self.bot.exchange.balance = 105
+        self.bot.save()
+        state = json.loads(self.path.read_text())
+        state["settings"]["mode"] = "final3_smart_reversal"
+        self.path.write_text(json.dumps(state))
+        before = self.path.read_bytes()
+        restored = Final3PaperHunter(self.path, market_data=self.data)
+        self.assertEqual(restored.exchange.balance, 105)
+        self.assertEqual(next(self.path.parent.glob("*.bak")).read_bytes(), before)
 
-class VariantIsolationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reversal_open_state_is_preserved_and_not_converted(self):
-        from migrate_idle_state import approved_reversal_settings
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "previous.json"
-            data = DynamicPublicData()
-            bot = Final2PaperHunter(path, market_data=data)
-            await bot.enter("BTC/USDT:USDT", "buy", 100)
-            state = json.loads(path.read_text())
-            state["settings"] = approved_reversal_settings()
-            path.write_text(json.dumps(state))
-            before = path.read_bytes()
-            with self.assertRaisesRegex(ValueError, "Previous-strategy positions"):
-                Final2PaperHunter(path, market_data=data)
-            self.assertEqual(path.read_bytes(), before)
-
-    async def test_idle_reversal_state_can_migrate_with_backup(self):
-        from migrate_idle_state import approved_reversal_settings
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "idle.json"
-            data = DynamicPublicData()
-            bot = Final2PaperHunter(path, market_data=data)
-            bot.exchange.balance = 105
-            bot.save()
-            state = json.loads(path.read_text())
-            state["settings"] = approved_reversal_settings()
-            path.write_text(json.dumps(state))
-            before = path.read_bytes()
-            restored = Final2PaperHunter(path, market_data=data)
-            self.assertEqual(restored.exchange.balance, 105)
-            self.assertEqual(next(path.parent.glob("*.bak")).read_bytes(), before)
+    async def test_other_open_strategies_and_risk_changes_are_rejected(self):
+        await self.bot.enter("BTC/USDT:USDT", "buy", 100)
+        original = json.loads(self.path.read_text())
+        for mode, stop in [
+            ("final3_smart_reversal", 0.03),
+            ("final3_scale_trail", 0.07),
+            ("final3_staged_partial", 0.03),
+        ]:
+            state = json.loads(json.dumps(original))
+            state["settings"].update(mode=mode, STOP_LOSS_PCT=stop)
+            self.path.write_text(json.dumps(state))
+            before = self.path.read_bytes()
+            with self.assertRaises(ValueError):
+                Final3PaperHunter(self.path, market_data=self.data)
+            self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == "__main__":

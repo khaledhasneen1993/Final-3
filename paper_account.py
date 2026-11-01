@@ -1,32 +1,17 @@
-"""Virtual account and persistent state for the approved V2 simulation."""
+"""Paper-only account for the approved Final-3 strategy; no private trading endpoints."""
 
 import asyncio
 import json
 import math
 import time
+from datetime import datetime, timezone
+import config as strategy
 
 MAX_TICKER_AGE = 10.0
 TICKER_TIMEOUT = 10.0
-from datetime import datetime, timezone
-
-import binance_cascade_hunter_dynamic_v2 as strategy
-
-
-class PartialStopCrossed(ValueError):
-    def __init__(self, price):
-        self.price = price
-        super().__init__("Full stop crossed before partial execution")
-
-
-class ReversalStopCrossed(ValueError):
-    def __init__(self, price):
-        self.price = price
-        super().__init__("Original stop crossed before reversal execution")
 
 
 class PaperExchange:
-    """Explicit public-data allowlist. Orders and balances exist only in memory."""
-
     def __init__(self, market_data, fee_rate=0.0005, leverage=None):
         self.market_data = market_data
         self.fee_rate = fee_rate
@@ -47,7 +32,7 @@ class PaperExchange:
     @property
     def equity(self):
         return self.balance + sum(
-            (self.prices.get(p.get("symbol", s), p["entry"]) - p["entry"])
+            (self.prices.get(s, p["entry"]) - p["entry"])
             * p["amount"]
             * (1 if p["side"] == "buy" else -1)
             for s, p in self.positions.items()
@@ -56,11 +41,17 @@ class PaperExchange:
     async def load_markets(self):
         return await self.market_data.load_markets()
 
+    async def fetch_tickers(self):
+        return await self.market_data.fetch_tickers()
+
     async def fetch_ohlcv(self, symbol, timeframe, limit):
         return await self.market_data.fetch_ohlcv(symbol, timeframe, limit=limit)
 
     async def fetch_order_book(self, symbol, limit):
         return await self.market_data.fetch_order_book(symbol, limit=limit)
+
+    def amount_to_precision(self, symbol, amount):
+        return self.market_data.amount_to_precision(symbol, amount)
 
     async def fetch_ticker(self, symbol):
         ticker = await asyncio.wait_for(
@@ -80,64 +71,34 @@ class PaperExchange:
         self.prices[symbol] = price
         return ticker
 
-    def amount_to_precision(self, symbol, amount):
-        return self.market_data.amount_to_precision(symbol, amount)
-
-    async def fetch_balance(self):
-        return {"USDT": {"free": self.free, "used": self.used, "total": self.balance}}
-
-    async def set_leverage(self, leverage, symbol):
-        # Never call a private Binance endpoint.
-        if leverage != self.leverage:
-            raise ValueError("Leverage must match the original strategy")
-
     async def create_order(self, symbol, type, side, amount, params=None):
-        if type != "market" or side not in {"buy", "sell"}:
-            raise ValueError("Paper account supports buy/sell market orders only")
+        params = params or {}
+        if type != "market" or side not in ("buy", "sell"):
+            raise ValueError("Invalid paper order")
         amount = float(amount)
         if not math.isfinite(amount) or amount <= 0:
             raise ValueError("Invalid amount")
-        params = params or {}
-        position_id = params.get("positionId", symbol)
-        closing = bool(params.get("reduceOnly", False))
-        position = self.positions.get(position_id)
-        if position and position.get("symbol", position_id) != symbol:
-            raise ValueError("Position ID does not match market symbol")
-        if not closing and not params.get("hedge") and not params.get("scaleIn"):
-            if any(p.get("symbol", key) == symbol for key, p in self.positions.items()):
-                raise ValueError("Position already exists")
-        if closing and (
-            not position
-            or position["side"] == side
-            or (
-                amount > position["amount"]
-                and not math.isclose(amount, position["amount"])
-            )
-        ):
-            raise ValueError("Invalid reduce-only close")
+        if params.get("positionId", symbol) != symbol:
+            raise ValueError("Final-3 uses one position per market")
+        closing = bool(params.get("reduceOnly"))
+        position = self.positions.get(symbol)
+        if closing:
+            if (
+                not position
+                or position["side"] == side
+                or (
+                    amount > position["amount"]
+                    and not math.isclose(amount, position["amount"])
+                )
+            ):
+                raise ValueError("Invalid reduce-only close")
+        elif position:
+            raise ValueError("Position already exists")
         full_close = bool(closing and math.isclose(amount, position["amount"]))
         if full_close:
             amount = position["amount"]
-        if not closing and position and not (params or {}).get("scaleIn"):
-            raise ValueError("Position already exists")
-        if not closing and position and position["side"] != side:
-            raise ValueError("Scale-in must match position direction")
-        execution_ticker = await self.fetch_ticker(symbol)
-        price = float(execution_ticker["last"])
-        if not closing and params.get("hedge"):
-            parent = self.positions.get(params.get("hedgeParent"))
-            if (
-                not parent
-                or parent.get("symbol", params.get("hedgeParent")) != symbol
-                or parent["side"] == side
-            ):
-                raise ValueError("Invalid reversal parent")
-            direction = 1 if parent["side"] == "buy" else -1
-            if direction * (price - params["parentStop"]) <= 0:
-                raise ReversalStopCrossed(price)
-            adverse = -direction * (price / params["parentEntry"] - 1)
-            if adverse + 1e-12 < params["reversalTrigger"]:
-                raise ValueError("Reversal threshold no longer met")
+        ticker = await self.fetch_ticker(symbol)
+        price = float(ticker["last"])
         if not closing and "quoteNotional" in params:
             quote = float(params["quoteNotional"])
             if not math.isfinite(quote) or quote <= 0:
@@ -145,10 +106,6 @@ class PaperExchange:
             amount = float(self.amount_to_precision(symbol, quote / price))
             if not math.isfinite(amount) or amount <= 0:
                 raise ValueError("Invalid rounded amount")
-        if closing and not full_close and (params or {}).get("partialStop") is not None:
-            direction = 1 if position["side"] == "buy" else -1
-            if direction * (price - float(params["partialStop"])) <= 0:
-                raise PartialStopCrossed(price)
         notional = amount * price
         fee = notional * self.fee_rate
         pnl = 0.0
@@ -164,13 +121,13 @@ class PaperExchange:
                 )
                 + fee
             )
-            realized_pnl = position.get("realized_pnl", 0.0) + pnl
+            realized_pnl = position.get("realized_pnl", 0) + pnl
             released_margin = position["margin"] * amount / position["amount"]
             self.balance += pnl - fee
             if full_close:
-                del self.positions[position_id]
+                del self.positions[symbol]
             else:
-                self.positions[position_id] = {
+                self.positions[symbol] = {
                     **position,
                     "amount": position["amount"] - amount,
                     "margin": position["margin"] - released_margin,
@@ -179,7 +136,7 @@ class PaperExchange:
                 }
         else:
             limits = self.market_data.market(symbol).get("limits", {})
-            for key, value in (("amount", amount), ("cost", notional)):
+            for key, value in [("amount", amount), ("cost", notional)]:
                 bounds = limits.get(key) or {}
                 if bounds.get("min") is not None and value < bounds["min"]:
                     raise ValueError(f"Below market minimum {key}")
@@ -188,79 +145,50 @@ class PaperExchange:
             margin = notional / self.leverage
             if margin + fee > self.free:
                 raise ValueError("Insufficient virtual margin including entry fee")
-            if (params.get("scaleIn") or params.get("hedge")) and margin + fee > max(
-                0.0, self.equity - self.used
-            ):
-                raise ValueError("Insufficient equity for additional margin")
             self.balance -= fee
-            if position:
-                combined = position["amount"] + amount
-                self.positions[position_id] = {
-                    "symbol": symbol,
-                    "position_id": position_id,
-                    "side": side,
-                    "entry": (position["entry"] * position["amount"] + price * amount)
-                    / combined,
-                    "amount": combined,
-                    "margin": position["margin"] + margin,
-                    "fees_paid": position.get(
-                        "fees_paid",
-                        position["entry"] * position["amount"] * self.fee_rate,
-                    )
-                    + fee,
-                    "realized_pnl": position.get("realized_pnl", 0.0),
-                }
-            else:
-                self.positions[position_id] = {
-                    "symbol": symbol,
-                    "position_id": position_id,
-                    "side": side,
-                    "entry": price,
-                    "amount": amount,
-                    "margin": margin,
-                }
-        trade = {
-            "id": f"paper-{len(self.trades) + 1}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol,
-            "position_id": position_id,
-            "side": side,
-            "amount": amount,
-            "price": price,
-            "market_timestamp": execution_ticker["timestamp"],
-            "price_source": "binance_usdm_last",
-            "reduceOnly": closing,
-            "scale_in": bool((params or {}).get("scaleIn")),
-            "fee_usdt": fee,
-            "pnl_usdt": pnl,
-            "balance_usdt": self.balance,
-        }
+            self.positions[symbol] = dict(
+                symbol=symbol,
+                position_id=symbol,
+                side=side,
+                entry=price,
+                amount=amount,
+                margin=margin,
+                fees_paid=fee,
+                realized_pnl=0.0,
+            )
+        trade = dict(
+            id=f"paper-{len(self.trades)+1}",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            position_id=symbol,
+            side=side,
+            amount=amount,
+            price=price,
+            market_timestamp=ticker["timestamp"],
+            price_source="binance_usdm_last",
+            reduceOnly=closing,
+            fee_usdt=fee,
+            pnl_usdt=pnl,
+            balance_usdt=self.balance,
+        )
         if closing:
             trade.update(
                 partial_close=not full_close,
-                exit_reason=(params or {}).get("exit_reason"),
+                exit_reason=params.get("exit_reason"),
                 remaining_amount=(
-                    0.0 if full_close else self.positions[position_id]["amount"]
+                    0.0 if full_close else self.positions[symbol]["amount"]
                 ),
                 released_margin_usdt=released_margin,
             )
             if full_close:
                 trade["position_net_pnl_usdt"] = realized_pnl - fees_paid
-        if params.get("hedge"):
-            trade.update(
-                is_reversal=True,
-                parent_position_id=params.get("hedgeParent"),
-                entry_reason="REVERSAL",
-            )
         self.trades.append(trade)
         strategy.log.info(
-            "PAPER FILL %s | %s %s | wallet=%.4f free=%.4f equity=%.4f",
+            "PAPER FILL %s | %s %s | balance=%.4f",
             trade["id"],
             side,
             symbol,
             self.balance,
-            self.free,
-            self.equity,
         )
         return {**trade, "average": price, "filled": amount, "status": "closed"}
 

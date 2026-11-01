@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
-from cascade_final2_paper import Final2PaperHunter
+from cascade_final3_paper import Final3PaperHunter
 from fixtures import DynamicPublicData
 
 S = "BTC/USDT:USDT"
@@ -17,7 +17,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.data = DynamicPublicData()
         self.path = Path(self.tmp.name) / "state.json"
-        self.bot = Final2PaperHunter(self.path, market_data=self.data)
+        self.bot = Final3PaperHunter(self.path, market_data=self.data)
 
     async def entry(self, side="buy"):
         self.data.price = 100
@@ -25,7 +25,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initial_fields_and_hard_stop_both_sides(self):
         for side in ["buy", "sell"]:
-            self.bot = Final2PaperHunter(
+            self.bot = Final3PaperHunter(
                 Path(self.tmp.name) / (side + ".json"), market_data=self.data
             )
             await self.entry(side)
@@ -112,7 +112,7 @@ class PartialTests(unittest.IsolatedAsyncioTestCase):
         await self.entry()
         self.data.price = 98.79
         await self.bot.manage_exits()
-        restored = Final2PaperHunter(self.path, market_data=self.data)
+        restored = Final3PaperHunter(self.path, market_data=self.data)
         self.assertEqual(restored.positions, self.bot.positions)
         await restored.manage_exits()
         self.assertEqual(len(restored.exchange.trades), 2)

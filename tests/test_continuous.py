@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import aiohttp
 
-from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter as DynamicPaperHunter
+from cascade_final3_paper import Final3PaperHunter as DynamicPaperHunter
 from continuous_scanner import CandleGap, ContinuousScanner
 from fixtures import DynamicPublicData
 
@@ -22,10 +22,22 @@ class StreamData(DynamicPublicData):
 
 
 def event(symbol="BTCUSDT", close=102, volume=10, stamp=NOW, offset=1):
-    return {"e": "kline", "E": stamp + offset, "s": symbol, "st": 1,
-            "k": {"s": symbol, "i": "1m", "t": stamp, "o": "100",
-                  "h": str(max(100, close)), "l": str(min(100, close)),
-                  "c": str(close), "v": str(volume)}}
+    return {
+        "e": "kline",
+        "E": stamp + offset,
+        "s": symbol,
+        "st": 1,
+        "k": {
+            "s": symbol,
+            "i": "1m",
+            "t": stamp,
+            "o": "100",
+            "h": str(max(100, close)),
+            "l": str(min(100, close)),
+            "c": str(close),
+            "v": str(volume),
+        },
+    }
 
 
 class ContinuousTests(unittest.IsolatedAsyncioTestCase):
@@ -37,7 +49,9 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         self.bot = DynamicPaperHunter(self.path, fee_rate=0, market_data=self.data)
         self.mono = 100.0
         self.wall = NOW / 1000
-        self.scanner = ContinuousScanner(self.bot, clock=lambda: self.mono, wall_clock=lambda: self.wall)
+        self.scanner = ContinuousScanner(
+            self.bot, clock=lambda: self.mono, wall_clock=lambda: self.wall
+        )
         await self.scanner.refresh_universe()
         await self.scanner.seed(self.scanner.symbols)
         self.scanner.connected = True
@@ -145,6 +159,9 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.scanner.signal(BTC))
         self.data.price = 105
         await self.bot.manage_exits()
+        self.assertIn(BTC, self.bot.positions)
+        self.data.price = self.bot.positions[BTC]["sl"] - 0.01
+        await self.bot.manage_exits()
         self.assertNotIn(BTC, self.bot.positions)
 
     async def test_failed_book_check_backs_off_without_entry(self):
@@ -184,6 +201,7 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
                         raise ConnectionError("simulated disconnect")
                     await asyncio.Future()
                     yield None
+
                 return messages()
 
         class Session:

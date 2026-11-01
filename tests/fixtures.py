@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+
 class PublicData:
     """No trading, balance or leverage endpoints exist on this fake client."""
 
@@ -27,18 +28,24 @@ class PublicData:
         return str(int(amount * 1000) / 1000)
 
     def market(self, symbol):
-        return {"linear": True, "swap": True, "settle": "USDT",
-                "limits": {"amount": {"min": 0.001}, "cost": {"min": 5}}}
+        return {
+            "linear": True,
+            "swap": True,
+            "settle": "USDT",
+            "limits": {"amount": {"min": 0.001}, "cost": {"min": 5}},
+        }
 
     async def close(self):
         self.closed = True
 
+
 class DynamicPublicData(PublicData):
     def __init__(self):
         super().__init__()
-        self.tickers = {s: {"quoteVolume": 20_000_000 + i * 1_000_000}
-                        for i, s in enumerate(("BTC/USDT:USDT", "ETH/USDT:USDT",
-                                               "SOL/USDT:USDT"))}
+        self.tickers = {
+            s: {"quoteVolume": 20_000_000 + i * 1_000_000}
+            for i, s in enumerate(("BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"))
+        }
 
     async def fetch_tickers(self):
         return self.tickers
